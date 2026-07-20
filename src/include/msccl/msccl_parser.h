@@ -86,6 +86,13 @@ static ncclResult_t mscclXmlGetAttrInt64(struct mscclXmlNode* node, const char* 
   return ncclSuccess;
 }
 
+static ncclResult_t mscclXmlGetAttrFloatDefault(struct mscclXmlNode* node, const char* attrName, float* value, float defaultValue) {
+  const char* str;
+  NCCLCHECK(mscclXmlGetAttr(node, attrName, &str));
+  *value = (str == NULL) ? defaultValue : strtof(str, NULL);
+  return ncclSuccess;
+}
+
 static ncclResult_t mscclXmlFindTag(struct mscclXml* xml, const char* tagName, struct mscclXmlNode** node) {
   *node = NULL;
   for (int i=0; i<xml->maxIndex; i++) {

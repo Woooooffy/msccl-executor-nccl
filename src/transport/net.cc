@@ -186,6 +186,18 @@ static ncclResult_t canConnect(int* ret, struct ncclTopoSystem* topo, struct ncc
 NCCL_PARAM(NetSharedBuffers, "NET_SHARED_BUFFERS", -2);
 NCCL_PARAM(NetSharedComms, "NET_SHARED_COMMS", 1);
 
+// MSCCL flow-rate control: pace isend calls per the rate caps the GPU stamps
+// into rateFifo (deci-GBps, 0 = unthrottled). NCCL_MSCCL_RATE_AGG optionally
+// spaces paced isends across ALL flows at an aggregate wire rate (deci-GBps).
+NCCL_PARAM(MscclRateControl, "MSCCL_RATE_CONTROL", 0);
+NCCL_PARAM(MscclRateAgg, "MSCCL_RATE_AGG", 0);
+
+static inline uint64_t mscclRateRng(uint64_t* s) {
+  uint64_t x = *s;
+  x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+  return *s = x;
+}
+
 struct setupReq {
   int tpRank;
   int tpLocalRank;
@@ -391,6 +403,8 @@ static ncclResult_t sendConnect(struct ncclComm* comm, struct ncclConnect* conne
   struct ncclRecvMem *recvMem = (struct ncclRecvMem*) NCCL_NET_MAP_GET_POINTER(map, gpu, recvMem);
   send->conn.tail = &recvMem->tail;
   send->conn.sizesFifo = recvMem->sizesFifo;
+  // Only wired when rate control is on, so the disabled path costs nothing on the GPU
+  send->conn.rateFifo = ncclParamMscclRateControl() ? recvMem->rateFifo : NULL;
   // Only fuse P2P buffers, continue to allocate dedicated buffers for ring/tree
   send->conn.offsFifo = map->shared ? recvMem->offsFifo : NULL;
 
@@ -797,6 +811,7 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
   // Don't give credits yet in shared mode.
   resources->sendMem->head = map->shared ? -NCCL_STEPS : 0;
   for (int i=0; i<NCCL_STEPS; i++) resources->recvMem->sizesFifo[i] = -1;
+  for (int i=0; i<NCCL_STEPS; i++) resources->recvMem->rateFifo[i] = 0;
 
   for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
     resources->buffers[p] = NCCL_NET_MAP_GET_POINTER(map, cpu, buffs[p]);
@@ -1073,6 +1088,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       // Round to next multiple of sliceSteps
       sub->base = ROUNDUP(resources->step, args->chunkSteps);
       sub->posted = sub->transmitted = sub->done = 0;
+      sub->nextSendTime = 0; // subs are pool-reused without memset; also covers CUDA-graph replays
       for (uint64_t step=0; step<sub->nsteps; step++) ncclProfilingRecord(args, s, step, ncclProxyProfileBegin);
     }
     args->state = ncclProxyOpProgress;
@@ -1118,6 +1134,10 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
         if (sizesFifo[buffSlot] != -1 && ((*recvTail > (sub->base+sub->transmitted)) || p == NCCL_PROTO_LL)) {
           // We have something to receive, let's check if it's completely ready.
           int size = sizesFifo[buffSlot];
+          // MSCCL rate control: rate cap the GPU stamped for this slot (deci-GBps, 0 = unthrottled)
+          int rate = 0;
+          if (ncclParamMscclRateControl())
+            rate = ((volatile int*)resources->recvMem->rateFifo)[buffSlot];
 
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_NET_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_NET_SEND_EXIT)
           sub->npKitSizesFifo[buffSlot] = size;
@@ -1152,6 +1172,12 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
               if (f1[0] != flag || f2[0] != flag) { ready = 0; break; }
             }
           }
+          if (ready && rate > 0) {
+            // Non-blocking pacing: if this flow (or the aggregate spacer) is not due
+            // yet, skip it and let the loop service other flows. Never block here.
+            struct ncclProxyProgressState* pstate = &proxyState->progressState;
+            if (pstate->nowNs < sub->nextSendTime || pstate->nowNs < pstate->nextWireTime) ready = 0;
+          }
           if (ready) {
             // Data is ready, try to send.
             NCCLCHECK(proxyState->ncclNet->isend(resources->netSendComm, buff, size, resources->tpRank, mhandle, sub->requests+buffSlot));
@@ -1178,6 +1204,20 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
 #endif
 
               TRACE(NCCL_NET, "sendProxy [%ld/%d] Isend posted, req %p", sub->transmitted, buffSlot, sub->requests[buffSlot]);
+              if (rate > 0) {
+                struct ncclProxyProgressState* pstate = &proxyState->progressState;
+                // 1 GBps = 1 byte/ns, so serialization time at `rate` deci-GBps is size*10/rate ns.
+                // Strict depth-1 spacing (no credit accumulation), jittered uniformly over
+                // [7/8, 9/8]*interval (mean = interval) to break cross-flow phase-lock.
+                uint64_t interval = (uint64_t)size * 10 / (uint64_t)rate;
+                uint64_t jitter = interval >= 8 ? mscclRateRng(&pstate->rngState) % (interval>>2) : 0;
+                sub->nextSendTime = pstate->nowNs + interval - (interval>>3) + jitter;
+                if (ncclParamMscclRateAgg() > 0)
+                  pstate->nextWireTime = pstate->nowNs + (uint64_t)size * 10 / (uint64_t)ncclParamMscclRateAgg();
+                // Reset before releasing the slot: these connections are shared with
+                // non-MSCCL collectives and LL/LL128, which never write rateFifo.
+                ((volatile int*)resources->recvMem->rateFifo)[buffSlot] = 0;
+              }
               sizesFifo[buffSlot] = -1;
               // Make sure size is reset to zero before we update the head.
               __sync_synchronize();

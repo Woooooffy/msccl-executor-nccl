@@ -482,6 +482,13 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
                 NCCLCHECK(mscclXmlGetAttrInt(stepNode, "deps", &dependStep));
                 NCCLCHECK(mscclXmlGetAttrInt(stepNode, "hasdep", &hasDependence));
 
+                float rate;
+                NCCLCHECK(mscclXmlGetAttrFloatDefault(stepNode, "rate", &rate, 0.0f));
+                if (rate < 0.0f || rate > 3276.0f) {
+                  WARN("MSCCL: rate (%f GBps) must be within [0, 3276]", rate);
+                  return ncclInternalError;
+                }
+
                 if (s >= MSCCL_MAX_NUM_STEPS){
                   WARN("MSCCL: too many steps are requested. Max number of steps: %d, requested: %d", MSCCL_MAX_NUM_STEPS, s+1);
                   return ncclInternalError;
@@ -580,6 +587,9 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
                   }
 
                   mscclTran->count = count;
+                  // Rate cap only applies to sending steps; stored as deci-GBps (0 = unthrottled).
+                  // +0.5f rounds to nearest instead of truncating (rate is non-negative).
+                  sTB->sendRate[numTransfers] = hasSend ? (int16_t)(rate * 10.0f + 0.5f) : 0;
 
                   if (hasSend) {
                     if (sendPeer < 0) {

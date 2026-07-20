@@ -56,6 +56,7 @@ struct ncclRecvMem {
       uint64_t tail;
       char pad1[CACHE_LINE_SIZE-sizeof(uint64_t)];
       int sizesFifo[NCCL_STEPS];
+      int rateFifo[NCCL_STEPS]; // MSCCL send rate cap in deci-GBps per slot (0 = unthrottled)
       int offsFifo[NCCL_STEPS];
       int flush; // For GDRCopy-based flush
     };

@@ -82,6 +82,7 @@ struct ncclProxySubArgs {
 #endif
   void* recvRequestsCache[NCCL_STEPS];
   int recvRequestsSubCount;
+  uint64_t nextSendTime; // MSCCL rate control: earliest ns this sub may isend again
 };
 
 struct ncclProxyArgs {
@@ -170,6 +171,11 @@ struct ncclProxyProgressState {
   struct ncclProxyArgs* pool;
   struct ncclProxyPool* pools;
   int nextOps;
+
+  // MSCCL rate control (owned by the single progress thread, no locking)
+  uint64_t nowNs;        // clock sampled once per progress-loop pass
+  uint64_t nextWireTime; // aggregate spacer: earliest ns ANY paced sub may isend
+  uint64_t rngState;     // xorshift state for deadline jitter
 };
 
 // Expected proxy response fifo

@@ -834,6 +834,8 @@ static int setProxyThreadContext(struct ncclProxyState* proxyState) {
 NCCL_PARAM(ProxyDumpSignal, "PROXY_DUMP_SIGNAL", -1);
 NCCL_PARAM(ProgressAppendOpFreq, "PROGRESS_APPENDOP_FREQ", 8);
 
+int64_t ncclParamMscclRateControl(); // defined in transport/net.cc
+
 void* ncclProxyProgress(void *proxyState_) {
   struct ncclProxyState* proxyState = (struct ncclProxyState*)proxyState_;
   if (setProxyThreadContext(proxyState)) {
@@ -861,6 +863,11 @@ void* ncclProxyProgress(void *proxyState_) {
   int proxyOpAppendCounter = 0;
   struct ncclProxyArgs profArgs; // Only used for profiling purposes
   while ((state->stop == 0 || (state->stop == 1 && state->active)) && *proxyState->abortFlag == 0) {
+    if (ncclParamMscclRateControl()) {
+      // MSCCL rate control: one clock sample per pass, shared by all flows' pacing checks
+      state->nowNs = clockNano();
+      if (state->rngState == 0) state->rngState = state->nowNs | 1;
+    }
     int idle = 1;
     ncclResult_t ret = progressOps(proxyState, state, state->active, &idle);
     if (ret != ncclSuccess) {

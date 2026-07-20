@@ -35,7 +35,8 @@ class Primitives<
                        NetDeviceUnpack = 0x2000,
                        AnyNetDeviceUnpack = 0x4000,
                        NvlsDirectRead = 0x8000,
-                       NvlsDirectWrite = 0x10000;
+                       NvlsDirectWrite = 0x10000,
+                       RateFifoEnabled = 0x20000;
   const int tid, tidInBlock;
   const int nthreads;
   int nworkers;
@@ -54,6 +55,8 @@ class Primitives<
     int volatile *connSizesFifoPtr; //  (flags & SizesFifoEnabled)
     T *directBuff;                  // !(flags & SizesFifoEnabled)
   };
+  int volatile *connRateFifoPtr;  // (flags & RateFifoEnabled) MSCCL rate cap fifo to proxy
+  int currentRate;                // deci-GBps stamped into connRateFifoPtr per slot (0 = unthrottled)
   uint64_t *connStepPtr;
   uint64_t connStepCache; // Cache last seen value of (*connStepPtr)
   void*    mhandle;
@@ -156,8 +159,11 @@ private:
     }
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
-      if (isSendNotRecv && (flags & SizesFifoEnabled))
+      if (isSendNotRecv && (flags & SizesFifoEnabled)) {
         connSizesFifoPtr[step%NCCL_STEPS] = nelts*sizeof(T);
+        if (flags & RateFifoEnabled)
+          connRateFifoPtr[step%NCCL_STEPS] = currentRate;
+      }
 
       void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
                                   : (ncclShmem.groups[group].srcs + Src);
@@ -584,6 +590,10 @@ private:
         if (conn->sizesFifo != nullptr) {
           flags |= SizesFifoEnabled;
           connSizesFifoPtr = conn->sizesFifo;
+          if (conn->rateFifo != nullptr) {
+            flags |= RateFifoEnabled;
+            connRateFifoPtr = conn->rateFifo;
+          }
         } else if (Direct) {
           // User buffers have been registered
           if ((conn->flags & (NCCL_IPC_READ|NCCL_IPC_WRITE)) && e != nullptr && e->regUsed) {
@@ -611,6 +621,12 @@ private:
   }
 
  public:
+  // MSCCL rate control: rate cap (deci-GBps, 0 = unthrottled) stamped into the
+  // send fifo slots of subsequent sends; consumed by the send proxy.
+  __device__ __forceinline__ void setSendRate(int rate) {
+    currentRate = rate;
+  }
+
   __device__ Primitives(
       int tid, int nthreads, int const *recvPeers, int const *sendPeers,
       void const *inputBuf, void *outputBuf, uint64_t redOpArg, uint8_t group=0,
@@ -634,6 +650,7 @@ private:
     int ng = nthreads / ThreadPerSync;
     index = tid % ThreadPerSync;
     flags = 0;
+    currentRate = 0; // unthrottled unless the MSCCL interpreter sets a per-step rate
     if (g == 0) {
       if (index < nrecv) flags |= RoleWaitRecv;
       if (index == nrecv) flags |= RoleInput;

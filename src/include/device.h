@@ -102,6 +102,7 @@ struct ncclConnInfo {
   uint64_t* redOpArgExchange; // PreOp scaler exchange for direct pull case
 
   int *sizesFifo;     // Sizes fifo from GPU to proxy
+  int *rateFifo;      // MSCCL rate cap fifo from GPU to proxy (deci-GBps, 0 = unthrottled)
   int *offsFifo;      // Buffer fifo from proxy to GPU
 
   uint64_t step;      // Keep where we are

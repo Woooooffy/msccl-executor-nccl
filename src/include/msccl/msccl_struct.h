@@ -59,6 +59,7 @@ struct alignas(16) mscclThreadBlock {
   int8_t dependentBid[MSCCL_MAX_NUM_STEPS]; // -1 if not dependent on any thread block, 256 bytes
   int16_t dependentStep[MSCCL_MAX_NUM_STEPS]; // 512 bytes
   int16_t reductionSrcOffsets[MSCCL_MAX_NUM_STEPS]; // 512 bytes
+  int16_t sendRate[MSCCL_MAX_NUM_STEPS]; // send rate cap in deci-GBps (0 = unthrottled), 128 bytes
   int16_t sendPeer;
   int16_t recvPeer;
   uint16_t nSteps;

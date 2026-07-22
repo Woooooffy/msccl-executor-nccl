@@ -56,6 +56,7 @@ class Primitives<
   uint64_t step;
   struct ncclConnInfo* conn = NULL;
   struct ncclConnFifo* connFifo = NULL;
+  int currentRate = 0; // MSCCL send rate cap (deci-GBps, 0 = unthrottled) stamped into connFifo per slot
   T* connEltsFifo;
   T* directBuff = NULL;
   uint64_t *connStepPtr;
@@ -149,8 +150,11 @@ private:
     }
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
-      if (flags & ConnFifoEnabled)
+      if (flags & ConnFifoEnabled) {
         connFifo[step%NCCL_STEPS].size = nelts*sizeof(T);
+        // MSCCL rate control: stamp the send proxy's per-slot rate cap (send side only).
+        if (isSendNotRecv) connFifo[step%NCCL_STEPS].rate = currentRate;
+      }
 
       void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
                                   : (ncclShmem.groups[group].srcs + Src);
@@ -717,6 +721,12 @@ private:
   }
 
  public:
+  // MSCCL rate control: cap (deci-GBps, 0 = unthrottled) stamped into the send
+  // fifo slots of subsequent sends; consumed by the send proxy.
+  __device__ __forceinline__ void setSendRate(int rate) {
+    currentRate = rate;
+  }
+
   __device__ Primitives(
       int tid, int nthreads, int const *recvPeers, int const *sendPeers,
       void const *inputBuf, void *outputBuf, uint64_t redOpArg, uint8_t group=0,

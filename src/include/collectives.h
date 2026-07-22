@@ -68,6 +68,7 @@ struct ncclConnFifo {
   int offset;
   ssize_t size;
   void* ptr;
+  int rate; // MSCCL send rate cap in deci-GBps (0 = unthrottled); GPU->send-proxy, per slot
 };
 
 #include <stdio.h>

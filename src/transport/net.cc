@@ -187,6 +187,18 @@ static ncclResult_t canConnect(int* ret, struct ncclComm* comm, struct ncclTopoG
 NCCL_PARAM(NetSharedBuffers, "NET_SHARED_BUFFERS", -2);
 NCCL_PARAM(NetSharedComms, "NET_SHARED_COMMS", 1);
 
+// MSCCL flow-rate control: pace isend calls per the rate caps the GPU stamps
+// into connFifo[].rate (deci-GBps, 0 = unthrottled). NCCL_MSCCL_RATE_AGG optionally
+// spaces paced isends across ALL flows at an aggregate wire rate (deci-GBps).
+NCCL_PARAM(MscclRateControl, "MSCCL_RATE_CONTROL", 0);
+NCCL_PARAM(MscclRateAgg, "MSCCL_RATE_AGG", 0);
+
+static inline uint64_t mscclRateRng(uint64_t* s) {
+  uint64_t x = *s;
+  x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+  return *s = x;
+}
+
 struct setupReq {
   int tpRank;
   int tpLocalRank;
@@ -815,6 +827,7 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
   (resources->gdcSync ? *resources->gdcSync : resources->sendMem->head) =
     (map->shared ? -NCCL_STEPS : 0);
   for (int i=0; i<NCCL_STEPS; i++) resources->recvMem->connFifo[i].size = -1;
+  for (int i=0; i<NCCL_STEPS; i++) resources->recvMem->connFifo[i].rate = 0; // MSCCL rate control
 
   for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
     resources->buffers[p] = NCCL_NET_MAP_GET_POINTER(map, cpu, buffs[p]);
@@ -1094,6 +1107,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       // Set step base for next op
       resources->step = sub->base + sub->nsteps;
       sub->posted = sub->transmitted = sub->done = 0;
+      sub->nextSendTime = 0; // subs are pool-reused without memset; also covers CUDA-graph replays
       ncclProfilerStartSendProxyOpEvent(s, args);
       if (sub->reg && sub->nbytes > 0) {
         NCCLCHECK(proxyState->ncclNet->regMr(resources->netSendComm, sub->recvbuff, sub->nbytes, NCCL_PTR_CUDA, &sub->mhandle));
@@ -1145,6 +1159,10 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
         if ((sub->reg || connFifo[buffSlot].size != -1) && ((*recvTail > tail) || p == NCCL_PROTO_LL)) {
           // We have something to receive, let's check if it's completely ready.
           int size = sub->reg ? std::min(MAX_NET_SIZE, sub->nbytes) : connFifo[buffSlot].size;
+          // MSCCL rate control: rate cap the GPU stamped for this slot (deci-GBps, 0 = unthrottled)
+          int rate = 0;
+          if (ncclParamMscclRateControl() && !sub->reg)
+            rate = connFifo[buffSlot].rate;
 
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_NET_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_NET_SEND_EXIT)
           sub->npKitSizesFifo[buffSlot] = size;
@@ -1181,6 +1199,12 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           } else if (p == NCCL_PROTO_SIMPLE && resources->shared) {
             buff = sub->reg ? (char*)sub->recvbuff : localBuff+resources->recvMem->connFifo[buffSlot].offset;
           }
+          if (ready && rate > 0) {
+            // Non-blocking pacing: if this flow (or the aggregate spacer) is not due
+            // yet, skip it and let the loop service other flows. Never block here.
+            struct ncclProxyProgressState* pstate = &proxyState->progressState;
+            if (pstate->nowNs < sub->nextSendTime || pstate->nowNs < pstate->nextWireTime) ready = 0;
+          }
           if (ready) {
             ncclProfilerRecordProxyOpEventState(s, args, sub->transmitted + args->sliceSteps, sub->transSize, ncclProfilerProxyOpSendRemFifoWait);
             // Data is ready, try to send.
@@ -1189,6 +1213,20 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
             // coverity[use_invalid:FALSE]
             NCCLCHECK(proxyState->ncclNet->isend(resources->netSendComm, buff, size, resources->tpRank, sub->mhandle, sub->requests+buffSlot));
             if (sub->requests[buffSlot] != NULL) {
+              if (rate > 0) {
+                struct ncclProxyProgressState* pstate = &proxyState->progressState;
+                // 1 GBps = 1 byte/ns, so serialization time at `rate` deci-GBps is size*10/rate ns.
+                // Strict depth-1 spacing (no credit accumulation), jittered uniformly over
+                // [7/8, 9/8]*interval (mean = interval) to break cross-flow phase-lock.
+                uint64_t interval = (uint64_t)size * 10 / (uint64_t)rate;
+                uint64_t jitter = interval >= 8 ? mscclRateRng(&pstate->rngState) % (interval>>2) : 0;
+                sub->nextSendTime = pstate->nowNs + interval - (interval>>3) + jitter;
+                if (ncclParamMscclRateAgg() > 0)
+                  pstate->nextWireTime = pstate->nowNs + (uint64_t)size * 10 / (uint64_t)ncclParamMscclRateAgg();
+                // Reset before releasing the slot: these connections are shared with
+                // non-MSCCL collectives and LL/LL128, which never write connFifo[].rate.
+                connFifo[buffSlot].rate = 0;
+              }
 
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_NET_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_NET_SEND_EXIT)
               NpKit::CollectCpuEvent(

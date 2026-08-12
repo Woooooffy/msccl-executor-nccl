@@ -1,0 +1,119 @@
+# nThread 1 nGpus 1 minBytes 4095 maxBytes 4095 step: 1048576(bytes) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid 1309159 on        ja2 device  0 [0000:01:00] Tesla V100-PCIE-16GB
+#  Rank  1 Group  0 Pid 925965 on        ja3 device  0 [0000:01:00] Tesla V100-PCIE-16GB
+ja2:1309159:1309159 [0] NCCL INFO cudaDriverVersion 12000
+ja2:1309159:1309159 [0] NCCL INFO NCCL version 2.23.4+cuda12.2
+ja2:1309159:1309168 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so. Using internal network plugin.
+ja2:1309159:1309168 [0] NCCL INFO NCCL_IB_HCA set to mlx5_0
+ja2:1309159:1309168 [0] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [RO]; OOB enp68s0f0:172.23.15.12<0>
+ja2:1309159:1309168 [0] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+ja2:1309159:1309168 [0] NCCL INFO Using network IB
+ja2:1309159:1309168 [0] NCCL INFO ncclCommInitRank comm 0xdf549b0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 1000 commId 0x3a782f083047a85d - Init START
+ja3:925965:925965 [0] NCCL INFO cudaDriverVersion 12000
+ja3:925965:925965 [0] NCCL INFO NCCL version 2.23.4+cuda12.2
+ja3:925965:925971 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so. Using internal network plugin.
+ja3:925965:925971 [0] NCCL INFO NCCL_IB_HCA set to mlx5_0
+ja3:925965:925971 [0] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [RO]; OOB enp68s0f0:172.23.15.13<0>
+ja3:925965:925971 [0] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+ja3:925965:925971 [0] NCCL INFO Using network IB
+ja3:925965:925971 [0] NCCL INFO ncclCommInitRank comm 0x49875440 rank 1 nranks 2 cudaDev 0 nvmlDev 0 busId 1000 commId 0x3a782f083047a85d - Init START
+ja3:925965:925971 [0] NCCL INFO NET/IB : GPU Direct RDMA Disabled for HCA 0 'mlx5_0'
+ja2:1309159:1309168 [0] NCCL INFO NET/IB : GPU Direct RDMA Disabled for HCA 0 'mlx5_0'
+ja2:1309159:1309168 [0] NCCL INFO comm 0xdf549b0 rank 0 nRanks 2 nNodes 2 localRanks 1 localRank 0 MNNVL 0
+ja3:925965:925971 [0] NCCL INFO comm 0x49875440 rank 1 nRanks 2 nNodes 2 localRanks 1 localRank 0 MNNVL 0
+ja2:1309159:1309168 [0] NCCL INFO MSCCL: No external scheduler found, using internal implementation
+ja2:1309159:1309168 [0] NCCL INFO MSCCL: Internal Scheduler will use /home/wangyj05/msccl_azure/executor/msccl-executor-nccl/build/lib/msccl-algorithms as algorithm directory and /home/wangyj05/msccl_azure/executor/msccl-executor-nccl/build/lib/../share/nccl/msccl-algorithms as share algorithm directory and /usr/share/nccl/msccl-algorithms as package installed share algorithm directory 
+ja3:925965:925971 [0] NCCL INFO MSCCL: No external scheduler found, using internal implementation
+ja3:925965:925971 [0] NCCL INFO MSCCL: Internal Scheduler will use /home/wangyj05/msccl_azure/executor/msccl-executor-nccl/build/lib/msccl-algorithms as algorithm directory and /home/wangyj05/msccl_azure/executor/msccl-executor-nccl/build/lib/../share/nccl/msccl-algorithms as share algorithm directory and /usr/share/nccl/msccl-algorithms as package installed share algorithm directory 
+ja2:1309159:1309168 [0] NCCL INFO Using MSCCL Algo files from /home/wangyj05/msccl_azure/executor/msccl-executor-nccl/build/lib/msccl-algorithms
+ja2:1309159:1309168 [0] NCCL INFO Channel 00/02 : 0 1
+ja2:1309159:1309168 [0] NCCL INFO Channel 01/02 : 0 1
+ja2:1309159:1309168 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] -1/-1/-1->0->1
+ja2:1309159:1309168 [0] NCCL INFO NCCL_BUFFSIZE set by environment to 4194304.
+ja2:1309159:1309168 [0] NCCL INFO NCCL_P2P_NET_CHUNKSIZE set by environment to 524288.
+ja2:1309159:1309168 [0] NCCL INFO P2P Chunksize set to 524288
+ja3:925965:925971 [0] NCCL INFO Using MSCCL Algo files from /home/wangyj05/msccl_azure/executor/msccl-executor-nccl/build/lib/msccl-algorithms
+ja3:925965:925971 [0] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] 0/-1/-1->1->-1
+ja3:925965:925971 [0] NCCL INFO NCCL_BUFFSIZE set by environment to 4194304.
+ja3:925965:925971 [0] NCCL INFO NCCL_P2P_NET_CHUNKSIZE set by environment to 524288.
+ja3:925965:925971 [0] NCCL INFO P2P Chunksize set to 524288
+ja2:1309159:1309170 [0] NCCL INFO [Proxy Service] Device 0 CPU core 192
+ja3:925965:925973 [0] NCCL INFO [Proxy Service] Device 0 CPU core 64
+ja3:925965:925974 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 64
+ja2:1309159:1309171 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 192
+ja3:925965:925971 [0] NCCL INFO NCCL_PROTO set by environment to Simple
+ja3:925965:925971 [0] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+ja3:925965:925971 [0] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+ja2:1309159:1309168 [0] NCCL INFO NCCL_PROTO set by environment to Simple
+ja2:1309159:1309168 [0] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+ja2:1309159:1309168 [0] NCCL INFO 2 coll channels, 2 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+ja2:1309159:1309168 [0] NCCL INFO CC Off, Multi-GPU CC Off, workFifoBytes 1048576
+ja3:925965:925971 [0] NCCL INFO MSCCL: Initialization finished
+ja3:925965:925971 [0] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so libnccl-net.so. Using internal tuner plugin.
+ja3:925965:925971 [0] NCCL INFO ncclCommInitRank comm 0x49875440 rank 1 nranks 2 cudaDev 0 nvmlDev 0 busId 1000 commId 0x3a782f083047a85d - Init COMPLETE
+ja3:925965:925971 [0] NCCL INFO Init timings - ncclCommInitRank: rank 1 nranks 2 total 0.04 (kernels 0.00, alloc 0.03, bootstrap 0.00, allgathers 0.00, topo 0.00, graphs 0.00, connections 0.00, rest 0.00)
+ja2:1309159:1309168 [0] NCCL INFO MSCCL: Initialization finished
+ja2:1309159:1309168 [0] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so libnccl-net.so. Using internal tuner plugin.
+ja2:1309159:1309168 [0] NCCL INFO ncclCommInitRank comm 0xdf549b0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 1000 commId 0x3a782f083047a85d - Init COMPLETE
+ja2:1309159:1309168 [0] NCCL INFO Init timings - ncclCommInitRank: rank 0 nranks 2 total 0.24 (kernels 0.00, alloc 0.02, bootstrap 0.20, allgathers 0.00, topo 0.00, graphs 0.00, connections 0.00, rest 0.00)
+#
+#                                                              out-of-place                       in-place          
+#       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)       
+ja2:1309159:1309172 [0] NCCL INFO NCCL_NET_SHARED_BUFFERS set by environment to 0.
+ja3:925965:925975 [0] NCCL INFO NCCL_NET_SHARED_BUFFERS set by environment to 0.
+ja2:1309159:1309170 [0] NCCL INFO New proxy recv connection 0 from local rank 0, transport 2
+ja2:1309159:1309173 [0] NCCL INFO [Proxy Progress] Device 0 CPU core 192
+ja2:1309159:1309172 [0] NCCL INFO Connected to proxy localRank 0 -> connection 0x147880000cd0
+ja3:925965:925973 [0] NCCL INFO New proxy recv connection 0 from local rank 0, transport 2
+ja3:925965:925975 [0] NCCL INFO Connected to proxy localRank 0 -> connection 0x151854000d10
+ja3:925965:925976 [0] NCCL INFO [Proxy Progress] Device 0 CPU core 64
+ja3:925965:925975 [0] NCCL INFO Channel 00/1 : 0[0] -> 1[0] [receive] via NET/IB/0
+ja3:925965:925973 [0] NCCL INFO New proxy recv connection 1 from local rank 0, transport 2
+ja3:925965:925975 [0] NCCL INFO Connected to proxy localRank 0 -> connection 0x151854000d88
+ja2:1309159:1309172 [0] NCCL INFO Channel 00/1 : 1[0] -> 0[0] [receive] via NET/IB/0
+ja2:1309159:1309170 [0] NCCL INFO New proxy recv connection 1 from local rank 0, transport 2
+ja2:1309159:1309172 [0] NCCL INFO Connected to proxy localRank 0 -> connection 0x147880000d48
+ja3:925965:925975 [0] NCCL INFO Channel 01/1 : 0[0] -> 1[0] [receive] via NET/IB/0
+ja3:925965:925973 [0] NCCL INFO New proxy send connection 2 from local rank 0, transport 2
+ja2:1309159:1309172 [0] NCCL INFO Channel 01/1 : 1[0] -> 0[0] [receive] via NET/IB/0
+ja3:925965:925975 [0] NCCL INFO Connected to proxy localRank 0 -> connection 0x151854000e00
+ja2:1309159:1309170 [0] NCCL INFO New proxy send connection 2 from local rank 0, transport 2
+ja3:925965:925975 [0] NCCL INFO Channel 00/1 : 1[0] -> 0[0] [send] via NET/IB/0
+ja3:925965:925973 [0] NCCL INFO New proxy send connection 3 from local rank 0, transport 2
+ja2:1309159:1309172 [0] NCCL INFO Connected to proxy localRank 0 -> connection 0x147880000dc0
+ja3:925965:925975 [0] NCCL INFO Connected to proxy localRank 0 -> connection 0x151854000e78
+ja2:1309159:1309172 [0] NCCL INFO Channel 00/1 : 0[0] -> 1[0] [send] via NET/IB/0
+ja3:925965:925975 [0] NCCL INFO Channel 01/1 : 1[0] -> 0[0] [send] via NET/IB/0
+ja2:1309159:1309170 [0] NCCL INFO New proxy send connection 3 from local rank 0, transport 2
+ja2:1309159:1309172 [0] NCCL INFO Connected to proxy localRank 0 -> connection 0x147880000e38
+ja2:1309159:1309172 [0] NCCL INFO Channel 01/1 : 0[0] -> 1[0] [send] via NET/IB/0
+ja2:1309159:1309170 [0] NCCL INFO NCCL_IB_QPS_PER_CONNECTION set by environment to 1.
+ja3:925965:925973 [0] NCCL INFO NCCL_IB_QPS_PER_CONNECTION set by environment to 1.
+ja2:1309159:1309170 [0] NCCL INFO NCCL_IB_SEND_QUEUE_DEPTH set by environment to 0.
+ja2:1309159:1309170 [0] NCCL INFO NCCL_IB_FRAG_SIZE set by environment to -1.
+ja3:925965:925973 [0] NCCL INFO NCCL_IB_SEND_QUEUE_DEPTH set by environment to 0.
+ja3:925965:925973 [0] NCCL INFO NCCL_IB_FRAG_SIZE set by environment to -1.
+ja3:925965:925973 [0] NCCL INFO NET/IB: NCCL Dev 0 IbDev 0 Port 1 qpn 2789 mtu 5 LID 23 subnet-prefix 33022  FLID 0 fifoRkey=0x180bca fifoLkey=0x180bca
+ja2:1309159:1309170 [0] NCCL INFO NET/IB: NCCL Dev 0 IbDev 0 Port 1 qpn 2870 mtu 5 LID 22 subnet-prefix 33022  FLID 0 fifoRkey=0x183af9 fifoLkey=0x183af9
+ja2:1309159:1309170 [0] NCCL INFO NET/IB: NCCL Dev 0 IbDev 0 Port 1 qpn 2871 mtu 5 LID 22 subnet-prefix 33022  FLID 0 fifoRkey=0x1fe1a0 fifoLkey=0x1fe1a0
+ja2:1309159:1309170 [0] NCCL INFO NCCL_IB_FRAG_BATCH set by environment to 2.
+ja2:1309159:1309170 [0] NCCL INFO NET/IB: MTU fragmentation on: fragSize=4096 batch=2 sqDepth=2048 nqps=1
+ja3:925965:925973 [0] NCCL INFO NET/IB: NCCL Dev 0 IbDev 0 Port 1 qpn 2792 mtu 5 LID 23 subnet-prefix 33022  FLID 0 fifoRkey=0x1800c0 fifoLkey=0x1800c0
+ja3:925965:925973 [0] NCCL INFO NCCL_IB_FRAG_BATCH set by environment to 2.
+ja3:925965:925973 [0] NCCL INFO NET/IB: MTU fragmentation on: fragSize=4096 batch=2 sqDepth=2048 nqps=1
+ja3:925965:925973 [0] NCCL INFO NET/IB: MTU fragmentation on: fragSize=4096 batch=2 sqDepth=2048 nqps=1
+ja2:1309159:1309170 [0] NCCL INFO NET/IB: MTU fragmentation on: fragSize=4096 batch=2 sqDepth=2048 nqps=1
+ja2:1309159:1309173 [0] NCCL INFO NCCL_IB_SPLIT_DATA_ON_QPS set by environment to 0.
+ja3:925965:925976 [0] NCCL INFO NCCL_IB_SPLIT_DATA_ON_QPS set by environment to 0.
+        4092          1023     float     sum      -1    19.83    0.21    0.21      0    19.34    0.21    0.21    N/A
+ja3:925965:925965 [0] NCCL INFO comm 0x49875440 rank 1 nranks 2 cudaDev 0 busId 1000 - Destroy COMPLETE
+ja3:925965:925965 [0] NCCL INFO MSCCL: Teardown finished
+ja2:1309159:1309159 [0] NCCL INFO comm 0xdf549b0 rank 0 nranks 2 cudaDev 0 busId 1000 - Destroy COMPLETE
+ja2:1309159:1309159 [0] NCCL INFO MSCCL: Teardown finished
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 0.209006 
+#
+

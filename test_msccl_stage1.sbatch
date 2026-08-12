@@ -69,6 +69,13 @@ export NCCL_IB_AR_THRESHOLD=0
 # NET is required for the fragmentation INFO line and the failure warnings.
 # INIT is required to confirm MSCCL actually loaded an algorithm rather than
 # silently falling back to RING/TREE.
+#
+# But mscclGetCaptureStatus logs at INFO under NCCL_INIT|NCCL_NET on every
+# collective call, from the application thread - so it interleaves mid-line
+# with the nccl-tests result table and makes it unreadable. NCCL_DEBUG_FILE
+# routes all NCCL debug output to per-host/per-pid files instead, leaving
+# stdout with nothing but the result table. %h and %p expand to hostname and
+# pid; it is set per case inside run_case.
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,ENV,NET
 
@@ -78,6 +85,12 @@ mkdir -p logs/msccl_stage1
 run_case() {
     local label="$1"
     local caselog="logs/msccl_stage1/${SLURM_JOB_ID}_${label}.log"
+    local dbgdir="logs/msccl_stage1/debug_${SLURM_JOB_ID}_${label}"
+    mkdir -p "$dbgdir"
+
+    # Send NCCL's debug stream to files so it cannot interleave with the result
+    # table on stdout. One file per host and pid.
+    export NCCL_DEBUG_FILE="$dbgdir/nccl.%h.%p.log"
 
     echo ""
     echo "========================================================"
@@ -91,34 +104,33 @@ run_case() {
 
     echo "--- checks for CASE $label ---"
 
+    # Assertions now read the debug files, not the result log.
+    local dbg="$dbgdir"/*.log
+
     # 1. Did MSCCL actually run? NCCL_ALGO=MSCCL,RING,TREE falls back silently
     #    to RING/TREE when no algorithm matches nRanks, in which case this test
     #    says nothing about the MSCCL path.
-    grep -m1 "algorithm directory" "$caselog" | sed 's/^/  ALGODIR: /'
-    if grep -qE "MSCCL.*[Aa]lgo.*(load|select)|mscclSetupConnections" "$caselog"; then
-        grep -mE3 "MSCCL.*[Aa]lgo.*(load|select)" "$caselog" | sed 's/^/  MSCCL: /'
-    else
-        echo "  !!! WARN: no MSCCL algorithm load line found - may have fallen back to RING/TREE."
-        echo "      Check that an algorithm exists for nRanks=3 and this collective."
-    fi
+    grep -h -m1 "Using MSCCL Algo files from" $dbg 2>/dev/null | sed 's/^/  MSCCL: /' \
+        || echo "  !!! WARN: no 'Using MSCCL Algo files' line - may have fallen back to RING/TREE."
+    grep -h -m1 "MSCCL: Setup Kernel finished" $dbg 2>/dev/null | sed 's/^/  MSCCL: /'
 
     # 2. Is fragmentation active?
-    if grep -q "MTU fragmentation on" "$caselog"; then
-        grep -m1 "MTU fragmentation on" "$caselog" | sed 's/^/  ACTIVE: /'
+    if grep -qh "MTU fragmentation on" $dbg 2>/dev/null; then
+        grep -h -m1 "MTU fragmentation on" $dbg | sed 's/^/  ACTIVE: /'
     else
         echo "  ACTIVE: fragmentation NOT active (expected for case A)"
     fi
 
-    # 3. Correctness.
+    # 3. Correctness, from the now-clean result table.
     grep -E "Out of bounds values|# Wrong|errors" "$caselog" | sed 's/^/  RESULT: /'
 
     # 4. Must never appear. On the MSCCL path nreqs==1 and sends are <= stepSize
     #    (~512kB, ~129 WRs against 2048 slots), so the budget cannot legitimately
     #    be exhausted - "posting unfragmented" here is a bug, not a tuning issue.
     for pat in "posting unfragmented" "credit ring overflow" "ibv_post_send() failed" "arena overflow"; do
-        if grep -q "$pat" "$caselog"; then
-            echo "  !!! FAIL: '$pat' found in $caselog"
-            grep -m3 "$pat" "$caselog" | sed 's/^/      /'
+        if grep -qh "$pat" $dbg 2>/dev/null; then
+            echo "  !!! FAIL: '$pat' found in $dbgdir"
+            grep -h -m3 "$pat" $dbg | sed 's/^/      /'
         fi
     done
 }

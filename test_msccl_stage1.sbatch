@@ -72,7 +72,7 @@ export NCCL_IB_AR_THRESHOLD=0
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,ENV,NET
 
-TESTBIN=$HOME/nccl-tests/build/allgather_perf
+TESTBIN=$HOME/nccl-tests/build/all_gather_perf
 mkdir -p logs/msccl_stage1
 
 run_case() {

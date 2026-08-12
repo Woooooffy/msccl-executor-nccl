@@ -1,0 +1,43 @@
+========================================================
+  branch : stage1-mtu-fragmentation
+  commit : 8c95cae
+  dirty  : 34 file(s) modified
+  libnccl: lrwxrwxrwx 1 wangyj05 wangyj05       17 Aug 12 14:55 /home/wangyj05/msccl_azure/executor/msccl-executor-nccl/build/lib/libnccl.so.2 -> libnccl.so.2.23.4
+========================================================
+
+========================================================
+  CASE A_baseline
+  NCCL_IB_FRAG_SIZE=0  NCCL_IB_FRAG_BATCH=2
+  Wed Aug 12 17:03:40 CST 2026
+========================================================
+slurmstepd-ja2: error: execve(): /home/wangyj05/nccl-tests/build/allgather_perf: No such file or directory
+srun: error: ja2: task 0: Exited with exit code 2
+slurmstepd-ja3: error: execve(): /home/wangyj05/nccl-tests/build/allgather_perf: No such file or directory
+srun: error: ja3: task 1: Exited with exit code 2
+slurmstepd-ja4: error: execve(): /home/wangyj05/nccl-tests/build/allgather_perf: No such file or directory
+srun: error: ja4: task 2: Exited with exit code 2
+--- checks for CASE A_baseline ---
+  !!! WARN: no MSCCL algorithm load line found - may have fallen back to RING/TREE.
+      Check that an algorithm exists for nRanks=3 and this collective.
+  ACTIVE: fragmentation NOT active (expected for case A)
+
+========================================================
+  CASE B_frag_k2
+  NCCL_IB_FRAG_SIZE=-1  NCCL_IB_FRAG_BATCH=2
+  Wed Aug 12 17:03:41 CST 2026
+========================================================
+slurmstepd-ja3: error: execve(): /home/wangyj05/nccl-tests/build/allgather_perf: No such file or directory
+srun: error: ja3: task 1: Exited with exit code 2
+slurmstepd-ja4: error: execve(): /home/wangyj05/nccl-tests/build/allgather_perf: No such file or directory
+srun: error: ja4: task 2: Exited with exit code 2
+slurmstepd-ja2: error: execve(): /home/wangyj05/nccl-tests/build/allgather_perf: No such file or directory
+srun: error: ja2: task 0: Exited with exit code 2
+--- checks for CASE B_frag_k2 ---
+  !!! WARN: no MSCCL algorithm load line found - may have fallen back to RING/TREE.
+      Check that an algorithm exists for nRanks=3 and this collective.
+  ACTIVE: fragmentation NOT active (expected for case A)
+
+========================================================
+  MSCCL stage 1 run complete: Wed Aug 12 17:03:43 CST 2026
+  Per-case logs: logs/msccl_stage1/312281_*.log
+========================================================

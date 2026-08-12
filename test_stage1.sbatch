@@ -14,12 +14,23 @@
 # low, the size range stops at 512M, and only one node pair is used. Run the
 # perf sweep from test.sbatch afterwards, once this is green.
 #
-# Four cases are run back to back so the comparison is within one job:
+# PHASE=correctness (cases A-E), single QP:
 #   A  fragmentation off                     - baseline, must match stock
 #   B  fragmentation off, deep send queue    - isolates the SQ resize
 #   C  fragmentation on, k=1                 - simplest fragmented path
 #   D  fragmentation on, k=2                 - the configuration of interest
 #   E  fragmentation on, k=2, awkward sizes  - exercises the tail fragment
+#
+# PHASE=qp (cases F-G): does multi-QP hide the fragmentation cost?
+#   The A-E run showed a 3-9% regression at 64kB-1MB that decays to zero above
+#   ~2MB, i.e. it lives in the latency-dominated regime. F sweeps QP count in
+#   both striping modes over exactly that band, with repeats, to see whether
+#   more queues recover it. G is the small-size correctness case that only
+#   multi-pass configurations can reach.
+#
+# Set PHASE=correctness, qp, or all. Default qp, since A-E already passed.
+PHASE="${PHASE:-qp}"
+REPS="${REPS:-3}"
 
 # --- Environment setup (mirrors test.sbatch) ---
 source /opt/spack/share/spack/setup-env.sh
@@ -67,9 +78,16 @@ export NCCL_P2P_NET_CHUNKSIZE=524288
 export NCCL_BUFFSIZE=4194304
 export NCCL_PROTO=Simple
 
-# --- Keep the QP layout trivial for the first run ---
-# One pass per isend, one QP: no chunkSize/length divergence, no zero-length
-# passes. Multi-QP is a later test.
+# --- QP layout ---
+# Defaults for the correctness phase: one pass per isend, one QP, so there is
+# no chunkSize/length divergence and no zero-length passes. The qp phase
+# overrides both per case.
+#
+# NOTE: both ranks read these independently from the environment - there is no
+# negotiation - and ncclIbIrecv posts recv WRs using the same
+# `split ? nqps : ndevs` formula the sender uses to post IMM WRs. A mismatch
+# between ranks desynchronises the walk and hangs. --export=ALL keeps them in
+# step; do not set them per-rank.
 export NCCL_IB_QPS_PER_CONNECTION=1
 export NCCL_IB_SPLIT_DATA_ON_QPS=0
 
@@ -100,15 +118,17 @@ run_case() {
     echo "  NCCL_IB_FRAG_SIZE=$NCCL_IB_FRAG_SIZE"
     echo "  NCCL_IB_FRAG_BATCH=$NCCL_IB_FRAG_BATCH"
     echo "  NCCL_IB_SEND_QUEUE_DEPTH=$NCCL_IB_SEND_QUEUE_DEPTH"
-    echo "  sizes: $sizes"
+    echo "  NCCL_IB_QPS_PER_CONNECTION=$NCCL_IB_QPS_PER_CONNECTION"
+    echo "  NCCL_IB_SPLIT_DATA_ON_QPS=$NCCL_IB_SPLIT_DATA_ON_QPS"
+    echo "  sizes: $sizes  iters: $ITERS"
     echo "  $(date)"
     echo "========================================================"
 
-    # -c 1 : verify results. This is the point of the run.
-    # -n/-w low: correctness, not timing.
+    # -c 1 throughout: the qp phase is the first time multi-pass configurations
+    # run at all, so it doubles as their correctness test.
     srun --mpi=pmix --ntasks=2 --ntasks-per-node=1 \
          --nodelist="$PAIR" --export=ALL \
-         $TESTBIN $sizes -g 1 -c 1 -n 20 -w 5 -G 0 -z 0 2>&1 | tee "$caselog"
+         $TESTBIN $sizes -g 1 -c 1 $ITERS -G 0 -z 0 2>&1 | tee "$caselog"
 
     # --- Post-run assertions on the log ---
     echo "--- checks for CASE $label ---"
@@ -132,6 +152,10 @@ run_case() {
         fi
     done
 }
+
+ITERS="-n 20 -w 5"
+
+if [[ "$PHASE" == "correctness" || "$PHASE" == "all" ]]; then
 
 # A - baseline. With FRAG_SIZE=0 the send queue depth is unchanged at
 #     2*MAX_REQUESTS, so this is genuinely stock behaviour.
@@ -158,13 +182,89 @@ export NCCL_IB_FRAG_BATCH=2
 run_case "D_frag_k2" "-b 8 -e 512M -f 2"
 
 # E - sizes that are not multiples of the 4kB fragment size. Powers of two never
-#     exercise the short tail fragment; these do.
+#     exercise the short tail fragment; these do. Note nccl-tests rounds to the
+#     datatype boundary, so ask for byte counts that survive that rounding.
 for s in 4095 4097 8191 12345 131071 524287; do
     run_case "E_odd_$s" "-b $s -e $s"
 done
 
+fi  # PHASE correctness
+
+if [[ "$PHASE" == "qp" || "$PHASE" == "all" ]]; then
+
+# ============================================================
+# F - can more QPs hide the fragmentation cost?
+#
+# The A-E run put the regression at 64kB-1MB, decaying to nothing by ~4MB,
+# i.e. it is a latency-regime cost, not a bandwidth-regime one. So sweep
+# exactly that band.
+#
+# The two striping modes test different mechanisms, and only one of them
+# plausibly helps:
+#
+#   SPLIT_DATA_ON_QPS=0  passes stay at ndevs (=1), so an isend still puts all
+#                        its fragments on one QP - but *successive* isends
+#                        round-robin onto different QPs. Tests whether the cost
+#                        is consecutive steps queueing behind each other in one
+#                        send queue.
+#
+#   SPLIT_DATA_ON_QPS=1  passes = nqps, so one isend is split across N QPs with
+#                        ~1/N the fragments each. Tests whether the HCA can
+#                        drain N shallower queues faster than one deep one.
+#                        Note this ADDS work: N trailing IMM WRs instead of 1,
+#                        and N doorbell batches minimum.
+#
+# Expect neither to fully recover it. The doorbell count is set by total
+# fragments and k, and every doorbell is issued by the same single proxy
+# progress thread regardless of how many QPs exist - so if the cost is CPU-side
+# WR construction and post_send calls, more queues cannot help. If multi-QP
+# *does* recover it, that is evidence the cost is HCA-side queue drain instead,
+# which would change where stage 3's pacing has to live.
+#
+# Repeated REPS times because the A-E conclusion rested on single runs.
+# ============================================================
+
+ITERS="-n 50 -w 20"
+QPBAND="-b 64K -e 2M -f 2"
+
+for rep in $(seq 1 $REPS); do
+  for qps in 1 2 4; do
+    for split in 0 1; do
+      # qps=1 makes the two modes identical; only run one of them.
+      [[ $qps -eq 1 && $split -eq 1 ]] && continue
+
+      export NCCL_IB_QPS_PER_CONNECTION=$qps
+      export NCCL_IB_SPLIT_DATA_ON_QPS=$split
+
+      export NCCL_IB_FRAG_SIZE=0
+      export NCCL_IB_FRAG_BATCH=2
+      run_case "F_r${rep}_qp${qps}_split${split}_fragoff" "$QPBAND"
+
+      export NCCL_IB_FRAG_SIZE=-1
+      run_case "F_r${rep}_qp${qps}_split${split}_fragon" "$QPBAND"
+    done
+  done
+done
+
+# G - multi-pass correctness at small sizes. This is the case the A-E run could
+#     not reach: with nqps>1 and split mode, chunkSize rounds up to 128B, so a
+#     100-byte message gives pass 0 all the data and pass 1 a negative length.
+#     That pass must still post its trailing IMM WR or the receiver waits
+#     forever on an unconsumed recv WR. A hang here, rather than wrong data, is
+#     the expected failure signature.
+ITERS="-n 20 -w 5"
+export NCCL_IB_SPLIT_DATA_ON_QPS=1
+export NCCL_IB_FRAG_SIZE=-1
+export NCCL_IB_FRAG_BATCH=2
+for qps in 2 4; do
+    export NCCL_IB_QPS_PER_CONNECTION=$qps
+    run_case "G_split_small_qp${qps}" "-b 8 -e 8K -f 2"
+done
+
+fi  # PHASE qp
+
 echo ""
 echo "========================================================"
-echo "  Stage 1 correctness run complete: $(date)"
+echo "  Stage 1 run complete (PHASE=$PHASE): $(date)"
 echo "  Per-case logs: logs/stage1/${SLURM_JOB_ID}_*.log"
 echo "========================================================"

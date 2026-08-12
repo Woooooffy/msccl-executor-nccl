@@ -71,6 +71,7 @@ struct alignas(64) ncclIbDev {
   char* pciPath;
   int realPort;
   int maxQp;
+  int maxQpWr;
   struct ncclIbMrCache mrCache;
   int ar; // ADAPTIVE_ROUTING
   struct ibv_port_attr portAttr;
@@ -98,6 +99,35 @@ NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", 0);
 NCCL_PARAM(IbAsyncEvents,"IB_RETURN_ASYNC_EVENTS",1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
+
+// Stage 1: software MTU fragmentation of RDMA writes.
+//
+// When enabled, each isend is split into fragments that fit in a single wire
+// packet, and the resulting work requests are chained k at a time behind one
+// ibv_post_send doorbell instead of handing the whole transfer to the HCA as a
+// single WR. The bytes on the wire, the remote offsets they land at, and the
+// number of receiver completions are all unchanged - only the WR shape and the
+// doorbell count differ.
+//
+//   NCCL_IB_FRAG_SIZE         0  disabled (stock single-WR behaviour)
+//                            -1  use the negotiated path MTU
+//                            >0  explicit fragment size in bytes
+//   NCCL_IB_FRAG_BATCH        k: WRs chained per ibv_post_send doorbell
+//   NCCL_IB_SEND_QUEUE_DEPTH  send queue depth to request, 0 = auto
+//
+// Fragmentation is all-or-nothing per pass: every fragment is exactly
+// NCCL_IB_FRAG_SIZE bytes (bar the tail), so a fragmented transfer always has
+// the property that one fragment == one packet. If a transfer does not fit the
+// send queue budget it is posted unfragmented rather than with coarser
+// fragments, and says so, so the invariant is never silently weakened.
+NCCL_PARAM(IbFragSize, "IB_FRAG_SIZE", 0);
+NCCL_PARAM(IbFragBatch, "IB_FRAG_BATCH", 2);
+NCCL_PARAM(IbSendQueueDepth, "IB_SEND_QUEUE_DEPTH", 0);
+
+// Default send queue depth when fragmentation is on: enough for 16 concurrent
+// fully-fragmented 512kB steps at a 4kB MTU. Raise NCCL_IB_SEND_QUEUE_DEPTH if
+// the "cannot fragment" warning fires.
+#define NCCL_IB_FRAG_DEFAULT_SQ_DEPTH 2048
 
 static ncclResult_t ncclIbStatsInit(struct ncclIbStats* stat) {
   __atomic_store_n(&stat->fatalErrorCount, 0, __ATOMIC_RELAXED);
@@ -576,6 +606,7 @@ build_ib_list:
           strncpy(ncclIbDevs[ncclNIbDevs].devName, devices[d]->name, MAXNAMESIZE);
           NCCLCHECKGOTO(ncclIbGetPciPath(ncclIbDevs[ncclNIbDevs].devName, &ncclIbDevs[ncclNIbDevs].pciPath, &ncclIbDevs[ncclNIbDevs].realPort), ret, fail);
           ncclIbDevs[ncclNIbDevs].maxQp = devAttr.max_qp;
+          ncclIbDevs[ncclNIbDevs].maxQpWr = devAttr.max_qp_wr;
           ncclIbDevs[ncclNIbDevs].mrCache.capacity = 0;
           ncclIbDevs[ncclNIbDevs].mrCache.population = 0;
           ncclIbDevs[ncclNIbDevs].mrCache.slots = NULL;
@@ -902,6 +933,21 @@ struct ncclIbQp {
   struct ibv_qp* qp;
   int devIndex;
   int remDevIdx;
+  int sqDepth; // send queue depth actually granted by ibv_create_qp
+};
+
+// Per-QP send queue occupancy, used by ncclIbMultiSendFrag to decide whether a
+// fragmented transfer fits. Only allocated on send comms with fragmentation on.
+//
+// Work requests are unsignalled except for the trailing one of each pass, so a
+// fragment's queue slot is not reclaimed until its pass completes. `pending` is
+// therefore a FIFO of per-pass WR counts: a pass pushes its count on post, and
+// its single completion pops it. RC completes in order, so head/tail order
+// matches completion order.
+struct ncclIbSqCredit {
+  int outstanding;
+  uint32_t head, tail;
+  uint16_t* pending; // [MAX_REQUESTS]
 };
 
 struct ncclIbRemSizesFifo {
@@ -955,6 +1001,16 @@ struct ncclIbSendComm {
   struct ncclIbRemSizesFifo remSizesFifo;
   uint64_t fifoHead;
   int ar; // Use adaptive routing when all merged devices have it enabled
+
+  // Stage 1 MTU fragmentation. fragSize == 0 means disabled, in which case none
+  // of the below is allocated and ncclIbMultiSend() runs unchanged.
+  int fragSize;    // bytes per fragment (128B multiple, <= path MTU)
+  int fragBatch;   // k: WRs chained per ibv_post_send
+  int fragCap;     // capacity of fragWrs/fragSges
+  struct ibv_send_wr* fragWrs;
+  struct ibv_sge* fragSges;
+  struct ncclIbSqCredit* sqCredit; // [base.nqps]
+  int fragWarned;  // rate-limit the "cannot fragment" warning to once per comm
 };
 // The SendFifo needs to be 32-byte aligned and each element needs
 // to be a 32-byte multiple, so that an entry does not get split and
@@ -1039,6 +1095,19 @@ returning:
   return res;
 }
 
+// Send queue depth to request. Stock NCCL posts at most 2 WRs per send, hence
+// the historical 2*MAX_REQUESTS; fragmentation posts one WR per fragment and
+// needs a far deeper queue, so the depth is decoupled from the request pool.
+// ibv_create_qp fails outright if we ask for more than the device supports, so
+// clamp to max_qp_wr rather than failing to connect.
+static int ncclIbSendQueueDepth(int ibDevN) {
+  int64_t depth = ncclParamIbSendQueueDepth();
+  if (depth <= 0) depth = ncclParamIbFragSize() != 0 ? NCCL_IB_FRAG_DEFAULT_SQ_DEPTH : 2*MAX_REQUESTS;
+  int devMax = ncclIbDevs[ibDevN].maxQpWr;
+  if (devMax > 0 && depth > devMax) depth = devMax;
+  return (int)depth;
+}
+
 ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base, int access_flags, void* qp_context, struct ncclIbQp* qp) {
   struct ibv_qp_init_attr qpInitAttr;
   memset(&qpInitAttr, 0, sizeof(struct ibv_qp_init_attr));
@@ -1046,13 +1115,17 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base, 
   qpInitAttr.send_cq = base->cq;
   qpInitAttr.recv_cq = base->cq;
   qpInitAttr.qp_type = IBV_QPT_RC;
-  // We might send 2 messages per send (RDMA and RDMA_WITH_IMM)
-  qpInitAttr.cap.max_send_wr = 2*MAX_REQUESTS;
+  // We might send 2 messages per send (RDMA and RDMA_WITH_IMM), or one WR per
+  // fragment when NCCL_IB_FRAG_SIZE is set.
+  qpInitAttr.cap.max_send_wr = ncclIbSendQueueDepth(base->ibDevN);
   qpInitAttr.cap.max_recv_wr = MAX_REQUESTS;
   qpInitAttr.cap.max_send_sge = 1;
   qpInitAttr.cap.max_recv_sge = 1;
   qpInitAttr.cap.max_inline_data = ncclParamIbUseInline() ? sizeof(struct ncclIbSendFifo) : 0;
   NCCLCHECK(wrap_ibv_create_qp(&qp->qp, base->pd, &qpInitAttr));
+  // The driver may round the request up; the granted depth is what the credit
+  // accounting in ncclIbMultiSendFrag budgets against.
+  qp->sqDepth = qpInitAttr.cap.max_send_wr;
   struct ibv_qp_attr qpAttr;
   memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
   qpAttr.qp_state = IBV_QPS_INIT;
@@ -1122,6 +1195,66 @@ ncclResult_t ncclIbRtsQp(struct ibv_qp* qp) {
   qpAttr.sq_psn = 0;
   qpAttr.max_rd_atomic = 1;
   NCCLCHECK(wrap_ibv_modify_qp(qp, &qpAttr, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC));
+  return ncclSuccess;
+}
+
+// Resolve the fragment size and allocate the WR arena and send queue credits.
+// Called once per send comm, after the QPs exist and remDevs (and therefore the
+// negotiated path MTU) are known. Leaves comm->fragSize == 0, i.e. stock
+// behaviour, if fragmentation is off or cannot be configured.
+static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
+  int64_t fragParam = ncclParamIbFragSize();
+  if (fragParam == 0) return ncclSuccess;
+
+  int fragSize;
+  if (fragParam > 0) {
+    fragSize = (int)fragParam;
+  } else {
+    // Smallest path MTU across the remote devices. remDevs[].mtu already holds
+    // the negotiated value: the accepting side mins it against its own
+    // active_mtu before echoing it back, and it is what ncclIbRtrQp programs
+    // as the QP's path_mtu, so a fragment of this size is exactly one packet.
+    enum ibv_mtu mtu = comm->base.remDevs[0].mtu;
+    for (int i = 1; i < comm->base.nRemDevs; i++) {
+      if (comm->base.remDevs[i].mtu < mtu) mtu = comm->base.remDevs[i].mtu;
+    }
+    fragSize = 256 << ((int)mtu - 1);
+  }
+
+  // Round down to the 128B multiple the multi-QP split relies on, so that a
+  // fragment boundary can never fall inside an LL or LL128 flag line.
+  fragSize = (fragSize/128)*128;
+  if (fragSize < 128) {
+    WARN("NET/IB: NCCL_IB_FRAG_SIZE=%ld resolves to %d bytes, too small to fragment; disabling", (long)fragParam, fragSize);
+    return ncclSuccess;
+  }
+
+  // A pass can never post more WRs than the shallowest send queue holds, so the
+  // granted queue depth is both the arena size and the fragmentation budget.
+  int cap = comm->base.qps[0].sqDepth;
+  for (int q = 1; q < comm->base.nqps; q++) {
+    if (comm->base.qps[q].sqDepth < cap) cap = comm->base.qps[q].sqDepth;
+  }
+  if (cap < NCCL_NET_IB_MAX_RECVS + 1) {
+    WARN("NET/IB: send queue depth %d too small to fragment; disabling", cap);
+    return ncclSuccess;
+  }
+
+  int batch = (int)ncclParamIbFragBatch();
+  if (batch < 1) batch = 1;
+
+  NCCLCHECK(ncclIbMalloc((void**)&comm->fragWrs, cap*sizeof(struct ibv_send_wr)));
+  NCCLCHECK(ncclIbMalloc((void**)&comm->fragSges, cap*sizeof(struct ibv_sge)));
+  NCCLCHECK(ncclCalloc(&comm->sqCredit, comm->base.nqps));
+  for (int q = 0; q < comm->base.nqps; q++) {
+    NCCLCHECK(ncclCalloc(&comm->sqCredit[q].pending, MAX_REQUESTS));
+  }
+
+  comm->fragSize = fragSize;
+  comm->fragBatch = batch;
+  comm->fragCap = cap;
+  INFO(NCCL_NET, "NET/IB: MTU fragmentation on: fragSize=%d batch=%d sqDepth=%d nqps=%d",
+      fragSize, batch, cap, comm->base.nqps);
   return ncclSuccess;
 }
 
@@ -1313,6 +1446,8 @@ ib_connect:
     NCCLCHECKGOTO(wrap_ibv_reg_mr(comm->remSizesFifo.mrs+i, comm->devs[i].base.pd, &comm->remSizesFifo.elems, sizeof(int)*MAX_REQUESTS*NCCL_NET_IB_MAX_RECVS, IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_READ), ret, fail);
   }
   comm->base.nRemDevs = remMeta.ndevs;
+
+  NCCLCHECKGOTO(ncclIbSetupFrag(comm), ret, fail);
 
   for (int q = 0; q < comm->base.nqps; q++) {
     struct ncclIbQpInfo* remQpInfo   = remMeta.qpInfo + q;
@@ -1822,6 +1957,170 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   return ncclSuccess;
 }
 
+// Fragmenting variant of ncclIbMultiSend, used when NCCL_IB_FRAG_SIZE is set.
+//
+// Same bytes at the same remote offsets, same imm_data, same one signalled WR
+// (and therefore one receiver completion) per QP pass. The differences are:
+//
+//  - each request's slice is split into comm->fragSize chunks, one WR each,
+//    so that a WR maps to a single wire packet;
+//  - the chain is cut into batches of comm->fragBatch WRs, each posted with its
+//    own ibv_post_send, so doorbells are spaced through the transfer rather
+//    than all data riding on one;
+//  - the WR list is rebuilt per pass instead of being built once and mutated,
+//    because the WR count now varies per pass and per request;
+//  - the trailing IMM WR is always separate. Every fragment is then a plain
+//    RDMA_WRITE and so eligible for adaptive routing, which is the shape the
+//    AR branch in ncclIbMultiSend reaches for above IB_AR_THRESHOLD.
+//
+// Fragmentation is all-or-nothing per pass: if the fragments would not fit the
+// send queue budget the pass is posted unfragmented, so a fragmented transfer
+// always has the property that one fragment is one packet.
+static ncclResult_t ncclIbMultiSendFrag(struct ncclIbSendComm* comm, int slot) {
+  struct ncclIbRequest** reqs = comm->fifoReqs[slot];
+  volatile struct ncclIbSendFifo* slots = comm->fifo[slot];
+  int nreqs = slots[0].nreqs;
+  if (nreqs > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
+
+  uint64_t wr_id = 0ULL;
+  for (int r=0; r<nreqs; r++) wr_id += (reqs[r] - comm->base.reqs) << (r*8);
+
+  // Same size-reporting scheme as ncclIbMultiSend: a single request's size fits
+  // in imm_data, several have to be RDMA-written into the peer's sizes fifo.
+  uint32_t immData = 0;
+  if (nreqs == 1) {
+    immData = reqs[0]->send.size;
+  } else {
+    int* sizes = comm->remSizesFifo.elems[slot];
+    for (int r=0; r<nreqs; r++) sizes[r] = reqs[r]->send.size;
+    comm->remSizesFifo.sge.addr = (uint64_t)sizes;
+    comm->remSizesFifo.sge.length = nreqs*sizeof(int);
+  }
+
+  // Multi-QP: make sure IB writes are multiples of 128B so that LL and LL128 protocols still work
+  const int align = 128;
+  int nqps = ncclParamIbSplitDataOnQps() ? comm->base.nqps : comm->base.ndevs;
+
+  for (int i = 0; i < nqps; i++) {
+    int qpIndex = comm->base.qpIndex;
+    ncclIbQp* qp = comm->base.qps + qpIndex;
+    int devIndex = qp->devIndex;
+    struct ncclIbSqCredit* credit = comm->sqCredit + qpIndex;
+
+    // This pass' slice of each request. Note chunkSize is what send.offset
+    // advances by, which differs from length on the final pass of a message
+    // whose size is not a multiple of nqps*align.
+    int chunkSizes[NCCL_NET_IB_MAX_RECVS];
+    int lengths[NCCL_NET_IB_MAX_RECVS];
+    int64_t totalBytes = 0;
+    for (int r=0; r<nreqs; r++) {
+      chunkSizes[r] = DIVUP(DIVUP(reqs[r]->send.size, nqps), align) * align;
+      lengths[r] = std::min(reqs[r]->send.size - reqs[r]->send.offset, chunkSizes[r]);
+      if (lengths[r] <= 0) lengths[r] = 0; // this QP has nothing left for this request
+      else totalBytes += lengths[r];
+    }
+
+    // WRs we may add without overrunning the send queue: what the queue holds,
+    // less what is still outstanding on it, less the trailing signalled WR.
+    int budget = qp->sqDepth - credit->outstanding - 1;
+    if (budget > comm->fragCap - 1) budget = comm->fragCap - 1;
+
+    // Fragment only if every fragment can be a full comm->fragSize. Otherwise
+    // post one WR per slice, exactly as ncclIbMultiSend would.
+    int fragSize = comm->fragSize;
+    int64_t nFrags = 0;
+    for (int r=0; r<nreqs; r++) nFrags += DIVUP(lengths[r], fragSize);
+    if (nFrags > budget) {
+      if (comm->fragWarned == 0) {
+        comm->fragWarned = 1;
+        WARN("NET/IB: %ld fragments needed for %ld bytes but only %d send queue slots free; "
+             "posting unfragmented. Raise NCCL_IB_SEND_QUEUE_DEPTH (currently %d) to fragment transfers this large.",
+             (long)nFrags, (long)totalBytes, budget, qp->sqDepth);
+      }
+      fragSize = 0; // one WR per slice
+    }
+
+    int nwr = 0;
+    for (int r=0; r<nreqs; r++) {
+      if (lengths[r] == 0) continue; // contribute no WRs, unlike the 0-byte WR
+                                     // ncclIbMultiSend needs for its fixed chain
+      int base = reqs[r]->send.offset;
+      int step = fragSize > 0 ? fragSize : lengths[r];
+      for (int off = 0; off < lengths[r]; off += step) {
+        if (nwr >= comm->fragCap - 1) {
+          WARN("NET/IB: fragment WR arena overflow (cap %d)", comm->fragCap);
+          return ncclInternalError;
+        }
+        int flen = std::min(step, lengths[r] - off);
+        struct ibv_sge* sge = comm->fragSges + nwr;
+        struct ibv_send_wr* wr = comm->fragWrs + nwr;
+        memset(wr, 0, sizeof(struct ibv_send_wr));
+        // Absolute addressing: send.offset is the per-pass cursor, off the
+        // per-fragment one. Equivalent to the incremental scheme in
+        // ncclIbMultiSend, which advances both ends by chunkSize per pass.
+        sge->addr   = (uintptr_t)reqs[r]->send.data + base + off;
+        sge->length = flen;
+        sge->lkey   = reqs[r]->send.lkeys[devIndex];
+        wr->opcode  = IBV_WR_RDMA_WRITE;
+        wr->sg_list = sge;
+        wr->num_sge = 1;
+        wr->wr.rdma.remote_addr = slots[r].addr + base + off;
+        wr->wr.rdma.rkey        = slots[r].rkeys[qp->remDevIdx];
+        wr->send_flags = 0;
+        nwr++;
+      }
+    }
+
+    // Trailing WR: carries the completion, and the sizes fifo write when there
+    // is more than one request. Always posted, even on a pass that carried no
+    // data, because the receiver posted one recv WR per pass and would
+    // otherwise wait forever.
+    struct ibv_send_wr* lastWr = comm->fragWrs + nwr;
+    memset(lastWr, 0, sizeof(struct ibv_send_wr));
+    if (nreqs > 1) {
+      comm->remSizesFifo.sge.lkey = comm->remSizesFifo.mrs[devIndex]->lkey;
+      lastWr->wr.rdma.remote_addr = comm->remSizesFifo.addr + slot*NCCL_NET_IB_MAX_RECVS*sizeof(int);
+      lastWr->wr.rdma.rkey = comm->remSizesFifo.rkeys[devIndex];
+      lastWr->num_sge = 1;
+      lastWr->sg_list = &comm->remSizesFifo.sge;
+    }
+    lastWr->wr_id = wr_id;
+    lastWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+    lastWr->imm_data = immData;
+    lastWr->send_flags = IBV_SEND_SIGNALED;
+    nwr++;
+
+    // Chain k at a time, one doorbell per batch. The terminator moves per
+    // batch, so next has to be rewritten here rather than once at build time.
+    for (int b = 0; b < nwr; b += comm->fragBatch) {
+      int n = std::min(comm->fragBatch, nwr - b);
+      for (int j = 0; j < n-1; j++) comm->fragWrs[b+j].next = comm->fragWrs + b+j+1;
+      comm->fragWrs[b+n-1].next = NULL;
+      struct ibv_send_wr* bad_wr;
+      NCCLCHECK(wrap_ibv_post_send(qp->qp, comm->fragWrs + b, &bad_wr));
+    }
+
+    // Record the pass' occupancy; its single completion releases all of it.
+    // One entry per outstanding pass, and a pass belongs to an outstanding
+    // request, so MAX_REQUESTS entries is always enough - but a leak here would
+    // silently corrupt the budget, so check rather than wrap.
+    if (credit->tail - credit->head >= MAX_REQUESTS) {
+      WARN("NET/IB: send queue credit ring overflow (%u outstanding passes)", credit->tail - credit->head);
+      return ncclInternalError;
+    }
+    credit->outstanding += nwr;
+    credit->pending[credit->tail % MAX_REQUESTS] = (uint16_t)nwr;
+    credit->tail++;
+
+    for (int r=0; r<nreqs; r++) reqs[r]->send.offset += chunkSizes[r];
+
+    // Select the next qpIndex
+    comm->base.qpIndex = (comm->base.qpIndex+1) % comm->base.nqps;
+  }
+
+  return ncclSuccess;
+}
+
 ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIsend() called when comm->base.ready == 0"); return ncclInternalError; }
@@ -1895,7 +2194,11 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
     }
 
     TIME_START(0);
-    NCCLCHECK(ncclIbMultiSend(comm, slot));
+    if (comm->fragSize > 0) {
+      NCCLCHECK(ncclIbMultiSendFrag(comm, slot));
+    } else {
+      NCCLCHECK(ncclIbMultiSend(comm, slot));
+    }
 
     // Clear slots[0]->nreqs, as well as other fields to help debugging and sanity checks
     memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
@@ -2134,6 +2437,23 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
               ncclSocketToString(&addr, line), wc->status, wc->opcode,wc->byte_len, wc->wr_id, req, req->type, req->events[0], req->events[1], i);
           #endif
           if (req && req->type == NCCL_NET_IB_REQ_SEND) {
+            // Release this pass' send queue slots. One signalled WR per pass,
+            // and RC completes in order, so popping the FIFO head matches the
+            // pass this completion belongs to.
+            if (r->base->isSend) {
+              struct ncclIbSendComm* sComm = (struct ncclIbSendComm*)r->base;
+              if (sComm->sqCredit) {
+                for (int q = 0; q < sComm->base.nqps; q++) {
+                  if (sComm->base.qps[q].qp->qp_num != wc->qp_num) continue;
+                  struct ncclIbSqCredit* credit = sComm->sqCredit + q;
+                  if (credit->head != credit->tail) {
+                    credit->outstanding -= credit->pending[credit->head % MAX_REQUESTS];
+                    credit->head++;
+                  }
+                  break;
+                }
+              }
+            }
             for (int j = 0; j < req->nreqs; j++) {
               struct ncclIbRequest* sendReq = r->base->reqs+((wc->wr_id >> (j*8)) & 0xff);
               if ((sendReq->events[i] <= 0)) {
@@ -2180,6 +2500,12 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
       if (comm->remSizesFifo.mrs[i] != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->remSizesFifo.mrs[i]));
       NCCLCHECK(ncclIbDestroyBase(&commDev->base));
     }
+    if (comm->sqCredit) {
+      for (int q = 0; q < comm->base.nqps; q++) free(comm->sqCredit[q].pending);
+      free(comm->sqCredit);
+    }
+    free(comm->fragWrs);
+    free(comm->fragSges);
     free(comm);
   }
   TIME_PRINT("IB");

@@ -1,6 +1,0 @@
-slurmstepd-ja2: error: execve(): /home/wangyj05/nccl-tests/build/allgather_perf: No such file or directory
-srun: error: ja2: task 0: Exited with exit code 2
-slurmstepd-ja3: error: execve(): /home/wangyj05/nccl-tests/build/allgather_perf: No such file or directory
-srun: error: ja3: task 1: Exited with exit code 2
-slurmstepd-ja4: error: execve(): /home/wangyj05/nccl-tests/build/allgather_perf: No such file or directory
-srun: error: ja4: task 2: Exited with exit code 2

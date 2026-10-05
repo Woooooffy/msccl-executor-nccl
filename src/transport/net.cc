@@ -140,6 +140,7 @@ struct sendNetResources {
   int netDeviceVersion;
   ncclNetDeviceType netDeviceType;
   ncclNetDeviceHandle_t* netDeviceHandle;
+  ncclNetMscclExt_t* mscclNetExt; // non-NULL iff MSCCL flow ids are passed to the net
 };
 
 struct recvNetResources {
@@ -186,6 +187,12 @@ static ncclResult_t canConnect(int* ret, struct ncclComm* comm, struct ncclTopoG
 
 NCCL_PARAM(NetSharedBuffers, "NET_SHARED_BUFFERS", -2);
 NCCL_PARAM(NetSharedComms, "NET_SHARED_COMMS", 1);
+// Pass each send's MSCCL flow id (XML mscclflowid, stamped per slot by the GPU)
+// down to the net. Requires the built-in IB transport.
+//   0 off, plain isend
+//   1 on
+//   2 on, and log every send's (rank, peer, channel, size, flow id) at INFO/NET
+NCCL_PARAM(MscclFlowId, "MSCCL_FLOW_ID", 0);
 
 struct setupReq {
   int tpRank;
@@ -700,6 +707,14 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
   ncclResult_t ret = ncclSuccess;
   netSendConnectArgs* req = (netSendConnectArgs*) reqBuff;
   NCCLCHECK(ncclNetGetDeviceHandle(resources->netDeviceType, resources->netDeviceVersion, false /*isRecv*/, &resources->netDeviceHandle));
+  if (ncclParamMscclFlowId()) {
+    // Fail here rather than send without the ids an XML asked for.
+    if (proxyState->ncclNet != &ncclNetIb) {
+      WARN("NCCL_MSCCL_FLOW_ID requires the built-in IB transport, but net %s is in use", proxyState->ncclNet->name);
+      return ncclInvalidUsage;
+    }
+    resources->mscclNetExt = &ncclNetIbMscclExt;
+  }
   if (resources->shared) {
     // Shared buffers
     struct ncclProxyProgressState* progressState = &proxyState->progressState;
@@ -814,7 +829,10 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
   // Don't give credits yet in shared mode.
   (resources->gdcSync ? *resources->gdcSync : resources->sendMem->head) =
     (map->shared ? -NCCL_STEPS : 0);
-  for (int i=0; i<NCCL_STEPS; i++) resources->recvMem->connFifo[i].size = -1;
+  for (int i=0; i<NCCL_STEPS; i++) {
+    resources->recvMem->connFifo[i].size = -1;
+    resources->recvMem->connFifo[i].flowId = 0;
+  }
 
   for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
     resources->buffers[p] = NCCL_NET_MAP_GET_POINTER(map, cpu, buffs[p]);
@@ -1187,7 +1205,19 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
             // Coverity complains about the size here as pointing to an out-of-scope temporary.  Which is nonsense,
             // since size is a plain integer.
             // coverity[use_invalid:FALSE]
-            NCCLCHECK(proxyState->ncclNet->isend(resources->netSendComm, buff, size, resources->tpRank, sub->mhandle, sub->requests+buffSlot));
+            if (resources->mscclNetExt) {
+              // Only Simple stamps the id; any other slot reads as "none". A
+              // registered-buffer send does not go through the per-slot fifo.
+              struct ncclNetSendMeta meta;
+              meta.flowId = (p == NCCL_PROTO_SIMPLE && !sub->reg) ? connFifo[buffSlot].flowId : 0;
+              NCCLCHECK(resources->mscclNetExt->isendMeta(resources->netSendComm, buff, size, resources->tpRank, sub->mhandle, &meta, sub->requests+buffSlot));
+              if (sub->requests[buffSlot] != NULL && ncclParamMscclFlowId() == 2) {
+                INFO(NCCL_NET, "MSCCL flowid send: rank %d -> %d channel %d proto %d slot %d size %d flowId %u",
+                     resources->tpRank, resources->tpRemoteRank, sub->channelId, p, buffSlot, size, meta.flowId);
+              }
+            } else {
+              NCCLCHECK(proxyState->ncclNet->isend(resources->netSendComm, buff, size, resources->tpRank, sub->mhandle, sub->requests+buffSlot));
+            }
             if (sub->requests[buffSlot] != NULL) {
 
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_NET_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_NET_SEND_EXIT)
@@ -1251,8 +1281,13 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
               connFifo[sub->base%NCCL_STEPS].size = -1;
             }
           }
-          // Make sure size is reset to -1 before we update the head.
-          if (sub->reg == 0) connFifo[buffSlot].size = -1;
+          // Make sure size is reset to -1 before we update the head. The flow id
+          // is cleared too, so a later LL/LL128 send on this slot, which never
+          // stamps one, cannot inherit it.
+          if (sub->reg == 0) {
+            connFifo[buffSlot].size = -1;
+            connFifo[buffSlot].flowId = 0;
+          }
           __sync_synchronize();
 
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_NET_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_NET_SEND_EXIT)

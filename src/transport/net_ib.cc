@@ -898,6 +898,7 @@ struct ncclIbRequest {
       void* data;
       uint32_t lkeys[NCCL_IB_MAX_DEVS_PER_NIC];
       int offset;
+      uint32_t flowId; // MSCCL flow id from ncclNetSendMeta, 0 = none
     } send;
     struct {
       int* sizes;
@@ -2121,7 +2122,10 @@ static ncclResult_t ncclIbMultiSendFrag(struct ncclIbSendComm* comm, int slot) {
   return ncclSuccess;
 }
 
-ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
+// meta may be NULL (plain ncclNet isend). It is copied into the request, so the
+// caller's copy need not outlive the call.
+static ncclResult_t ncclIbIsendImpl(void* sendComm, void* data, int size, int tag, void* mhandle,
+                                    const struct ncclNetSendMeta* meta, void** request) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIsend() called when comm->base.ready == 0"); return ncclInternalError; }
   if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }
@@ -2165,6 +2169,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
     req->send.size = size;
     req->send.data = data;
     req->send.offset = 0;
+    req->send.flowId = meta ? meta->flowId : 0;
 
     // Populate events
     int nEvents = ncclParamIbSplitDataOnQps() ? comm->base.nqps : comm->base.ndevs;
@@ -2211,6 +2216,19 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
   *request = NULL;
   return ncclSuccess;
 }
+
+ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
+  return ncclIbIsendImpl(sendComm, data, size, tag, mhandle, NULL, request);
+}
+
+static ncclResult_t ncclIbIsendMeta(void* sendComm, void* data, int size, int tag, void* mhandle,
+                                    const struct ncclNetSendMeta* meta, void** request) {
+  return ncclIbIsendImpl(sendComm, data, size, tag, mhandle, meta, request);
+}
+
+ncclNetMscclExt_t ncclNetIbMscclExt = {
+  ncclIbIsendMeta,
+};
 
 ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
   struct ibv_send_wr wr;

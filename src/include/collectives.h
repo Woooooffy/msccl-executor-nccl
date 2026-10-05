@@ -68,6 +68,7 @@ struct ncclConnFifo {
   int offset;
   ssize_t size;
   void* ptr;
+  uint32_t flowId; // MSCCL mscclflowid of this slot's send, 0 = none. GPU -> send proxy, Simple only
 };
 
 #include <stdio.h>

@@ -13,6 +13,8 @@
 #include "debug.h"
 #include "checks.h"
 #include <stdlib.h>
+#include <stdint.h>
+#include <errno.h>
 
 #include "msccl/msccl_struct.h"
 
@@ -83,6 +85,31 @@ static ncclResult_t mscclXmlGetAttrInt64(struct mscclXmlNode* node, const char* 
   const char* str;
   NCCLCHECK(mscclXmlGetAttrStr(node, attrName, &str));
   *value = strtoll(str, NULL, 0);
+  return ncclSuccess;
+}
+
+// Optional mscclflowid attribute. Absent means no id (0). Ids are numbered from
+// 1 by the XML generator, so 0 here can only come from an XML generated before
+// that convention, whose ids would all be off by one: reject it rather than let
+// it silently tag traffic with the wrong flow.
+static ncclResult_t mscclXmlGetFlowId(struct mscclXmlNode* node, uint32_t* value) {
+  const char* str;
+  NCCLCHECK(mscclXmlGetAttr(node, "mscclflowid", &str));
+  *value = 0;
+  if (str == NULL) return ncclSuccess;
+  char* end;
+  errno = 0;
+  long long v = strtoll(str, &end, 0);
+  if (end == str || *end != '\0' || errno != 0 || v < 0 || v > UINT32_MAX) {
+    WARN("MSCCL: mscclflowid \"%s\" is not an integer in [1, %u]", str, UINT32_MAX);
+    return ncclInvalidUsage;
+  }
+  if (v == 0) {
+    WARN("MSCCL: mscclflowid 0 is reserved for \"no flow id\"; ids start at 1. "
+         "The XML was likely generated with 0-based ids and must be regenerated.");
+    return ncclInvalidUsage;
+  }
+  *value = (uint32_t)v;
   return ncclSuccess;
 }
 

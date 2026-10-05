@@ -464,6 +464,8 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
             int numReductions = 0;
 
             int numTransfers = 0;
+            uint32_t tbSendFlowId = 0; // first send flow id seen on this thread block
+            bool tbFlowIdWarned = false;
             for (int st=0; st<threadBlockNode->nSubs; st++) {
               struct mscclXmlNode* stepNode = threadBlockNode->subs[st];
               if (strcmp(stepNode->name, "step") == 0) {
@@ -481,6 +483,8 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
                 NCCLCHECK(mscclXmlGetAttrInt(stepNode, "depid", &dependBid));
                 NCCLCHECK(mscclXmlGetAttrInt(stepNode, "deps", &dependStep));
                 NCCLCHECK(mscclXmlGetAttrInt(stepNode, "hasdep", &hasDependence));
+                uint32_t flowId;
+                NCCLCHECK(mscclXmlGetFlowId(stepNode, &flowId));
 
                 if (s >= MSCCL_MAX_NUM_STEPS){
                   WARN("MSCCL: too many steps are requested. Max number of steps: %d, requested: %d", MSCCL_MAX_NUM_STEPS, s+1);
@@ -542,6 +546,14 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
                   return ncclInternalError;
                 }
 
+                // A flow id names a network flow, so it only makes sense on a step
+                // that moves data to or from a peer.
+                if (flowId != 0 && !hasSend && !hasRecv) {
+                  WARN("MSCCL: step %d of thread block %d on GPU %d is of type %s and cannot carry mscclflowid %u",
+                       s, bid, id, type, flowId);
+                  return ncclInvalidUsage;
+                }
+
                 if (dependBid >= 0) {
                   sTB->dependentBid[numDependencies] = dependBid;
                   sTB->dependentStep[numDependencies] = dependStep;
@@ -580,6 +592,23 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
                   }
 
                   mscclTran->count = count;
+                  // The id is carried on the wire per send. On a recv-only step it
+                  // names the incoming flow, which the runtime does not use.
+                  sTB->sendFlowId[numTransfers] = hasSend ? flowId : 0;
+
+                  // A thread block sends on one (channel, peer) connection, i.e.
+                  // one QP. Two ids on it mean two switch paths under one RC QP,
+                  // whose packets can then arrive out of order.
+                  if (hasSend && flowId != 0) {
+                    if (tbSendFlowId == 0) {
+                      tbSendFlowId = flowId;
+                    } else if (flowId != tbSendFlowId && !tbFlowIdWarned) {
+                      WARN("MSCCL: thread block %d on GPU %d (channel %d, sendPeer %d) sends with more than one "
+                           "mscclflowid (%u and %u); they share one connection, so their packets may be reordered",
+                           bid, id, channelId, sendPeer, tbSendFlowId, flowId);
+                      tbFlowIdWarned = true;
+                    }
+                  }
 
                   if (hasSend) {
                     if (sendPeer < 0) {

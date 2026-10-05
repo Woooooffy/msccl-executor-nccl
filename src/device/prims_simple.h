@@ -56,6 +56,7 @@ class Primitives<
   uint64_t step;
   struct ncclConnInfo* conn = NULL;
   struct ncclConnFifo* connFifo = NULL;
+  uint32_t currentFlowId = 0; // MSCCL flow id stamped into the send slots of subsequent sends, 0 = none
   T* connEltsFifo;
   T* directBuff = NULL;
   uint64_t *connStepPtr;
@@ -149,8 +150,12 @@ private:
     }
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
-      if (flags & ConnFifoEnabled)
+      if (flags & ConnFifoEnabled) {
         connFifo[step%NCCL_STEPS].size = nelts*sizeof(T);
+        // Stamped on every send, so a kernel that never sets an id (stock NCCL
+        // on the same connection) writes 0 rather than leaving a stale one.
+        if (isSendNotRecv) connFifo[step%NCCL_STEPS].flowId = currentFlowId;
+      }
 
       void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
                                   : (ncclShmem.groups[group].srcs + Src);
@@ -717,6 +722,11 @@ private:
   }
 
  public:
+  // MSCCL flow id (0 = none) for subsequent sends; consumed by the send proxy.
+  __device__ __forceinline__ void setFlowId(uint32_t flowId) {
+    currentFlowId = flowId;
+  }
+
   __device__ Primitives(
       int tid, int nthreads, int const *recvPeers, int const *sendPeers,
       void const *inputBuf, void *outputBuf, uint64_t redOpArg, uint8_t group=0,

@@ -123,6 +123,10 @@ NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
 NCCL_PARAM(IbFragSize, "IB_FRAG_SIZE", 0);
 NCCL_PARAM(IbFragBatch, "IB_FRAG_BATCH", 2);
 NCCL_PARAM(IbSendQueueDepth, "IB_SEND_QUEUE_DEPTH", 0);
+// TEST ONLY. Posts headed fragments first to last, so each header overwrites
+// the tail of the fragment before it and the data is corrupted. Exists to show
+// that the correctness check catches a header/data ordering bug.
+NCCL_PARAM(IbFlowHdrTestMisorder, "IB_FLOW_HDR_TEST_MISORDER", 0);
 
 // Default send queue depth when fragmentation is on: enough for 16 concurrent
 // fully-fragmented 512kB steps at a 4kB MTU. Raise NCCL_IB_SEND_QUEUE_DEPTH if
@@ -676,6 +680,13 @@ build_ib_list:
       line[0] = '\0';
       // Determine whether RELAXED_ORDERING is enabled and possible
       ncclIbRelaxedOrderingEnabled = ncclIbRelaxedOrderingCapable();
+      // Flow headers overlap the previous fragment's tail and rely on it being
+      // written after them; relaxed ordering lets the HCA's PCIe writes land in
+      // any order, so it has to go.
+      if (ncclParamMscclFlowId() && ncclIbRelaxedOrderingEnabled) {
+        ncclIbRelaxedOrderingEnabled = 0;
+        INFO(NCCL_INIT|NCCL_NET, "NET/IB: PCIe relaxed ordering disabled: NCCL_MSCCL_FLOW_ID needs in-order data placement");
+      }
       for (int d = 0; d < ncclNMergedIbDevs; d++) {
         struct ncclIbMergedDev* mergedDev = ncclIbMergedDevs + d;
         if (mergedDev->ndevs > 1) {
@@ -927,7 +938,11 @@ struct ncclIbSendFifo {
   uint32_t nreqs;
   uint32_t tag;
   uint64_t idx;
-  char padding[24];
+  // Bytes before addr the sender may overwrite with a flow header (see
+  // ncclNetFlowHdr). Shares idx's 32B half, so it arrives with idx even under
+  // relaxed ordering. 0 from receivers that reserve nothing.
+  uint32_t headroom;
+  char padding[20];
 };
 
 struct ncclIbQp {
@@ -965,12 +980,14 @@ struct ncclIbRemSizesFifo {
 struct alignas(8) ncclIbSendCommDev {
   struct ncclIbNetCommDevBase base;
   struct ibv_mr* fifoMr;
+  struct ibv_mr* flowHdrMr; // registration of the send comm's flowHdrs
 };
 
 
 // Wrapper to track an MR per-device, if needed
 struct ncclIbMrHandle {
   ibv_mr* mrs[NCCL_IB_MAX_DEVS_PER_NIC];
+  int headroom; // advertised in every receive posted on this buffer, 0 = none
 };
 
 struct alignas(32) ncclIbNetCommBase {
@@ -1012,6 +1029,12 @@ struct ncclIbSendComm {
   struct ibv_sge* fragSges;
   struct ncclIbSqCredit* sqCredit; // [base.nqps]
   int fragWarned;  // rate-limit the "cannot fragment" warning to once per comm
+
+  // Flow header (NCCL_MSCCL_FLOW_ID). flowHdrData == 0 means no headers. Each
+  // request owns flowHdrs[its index], which stays untouched until the request
+  // is freed, i.e. after the NIC has read it for every fragment.
+  int flowHdrData; // data bytes per headed fragment: 128B multiple, + header <= fragSize
+  struct ncclNetFlowHdr* flowHdrs; // [MAX_REQUESTS]
 };
 // The SendFifo needs to be 32-byte aligned and each element needs
 // to be a 32-byte multiple, so that an entry does not get split and
@@ -1019,6 +1042,8 @@ struct ncclIbSendComm {
 static_assert((sizeof(struct ncclIbNetCommBase) % 32) == 0, "ncclIbNetCommBase size must be 32-byte multiple to ensure fifo is at proper offset");
 static_assert((offsetof(struct ncclIbSendComm, fifo) % 32) == 0, "ncclIbSendComm fifo must be 32-byte aligned");
 static_assert((sizeof(struct ncclIbSendFifo) % 32) == 0, "ncclIbSendFifo element size must be 32-byte multiples");
+static_assert(offsetof(struct ncclIbSendFifo, headroom)/32 == offsetof(struct ncclIbSendFifo, idx)/32,
+              "ncclIbSendFifo headroom must share idx's 32-byte half so it is valid once idx is");
 static_assert((offsetof(struct ncclIbSendComm, sges) % 32) == 0, "sges must be 32-byte aligned");
 static_assert((offsetof(struct ncclIbSendComm, wrs) % 32) == 0, "wrs must be 32-byte aligned");
 
@@ -1120,7 +1145,8 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base, 
   // fragment when NCCL_IB_FRAG_SIZE is set.
   qpInitAttr.cap.max_send_wr = ncclIbSendQueueDepth(base->ibDevN);
   qpInitAttr.cap.max_recv_wr = MAX_REQUESTS;
-  qpInitAttr.cap.max_send_sge = 1;
+  // A headed fragment is two SGEs: [flow header][payload].
+  qpInitAttr.cap.max_send_sge = ncclParamMscclFlowId() ? 2 : 1;
   qpInitAttr.cap.max_recv_sge = 1;
   qpInitAttr.cap.max_inline_data = ncclParamIbUseInline() ? sizeof(struct ncclIbSendFifo) : 0;
   NCCLCHECK(wrap_ibv_create_qp(&qp->qp, base->pd, &qpInitAttr));
@@ -1203,9 +1229,52 @@ ncclResult_t ncclIbRtsQp(struct ibv_qp* qp) {
 // Called once per send comm, after the QPs exist and remDevs (and therefore the
 // negotiated path MTU) are known. Leaves comm->fragSize == 0, i.e. stock
 // behaviour, if fragmentation is off or cannot be configured.
+// Flow headers: one per in-flight request, registered on every device so a
+// fragment's header SGE has a valid lkey whichever QP carries it.
+static ncclResult_t ncclIbSetupFlowHdr(struct ncclIbSendComm* comm) {
+  // Fragment 0's header lands in the pad before the receive slot, which only
+  // exists in front of the whole transfer. A send split into several passes
+  // (one per QP or device) would put a pass's first header on top of the
+  // previous pass's data, written on another QP with no ordering between them.
+  int passes = ncclParamIbSplitDataOnQps() ? comm->base.nqps : comm->base.ndevs;
+  if (passes != 1) {
+    WARN("NET/IB: NCCL_MSCCL_FLOW_ID needs each send on a single QP, but sends are split over %d "
+         "(set NCCL_IB_SPLIT_DATA_ON_QPS=0 or NCCL_IB_QPS_PER_CONNECTION=1, and use one NIC per connection)", passes);
+    return ncclInvalidUsage;
+  }
+  const int hdrSize = sizeof(struct ncclNetFlowHdr);
+  // The header shares the packet with the data, and the data must stay 128B
+  // aligned (LL/LL128 flag lines), so the data per fragment drops to the
+  // largest 128B multiple that still leaves room for the header.
+  int data = ((comm->fragSize - hdrSize)/128)*128;
+  if (data < 128) {
+    WARN("NET/IB: fragment size %d leaves no room for a %d-byte flow header", comm->fragSize, hdrSize);
+    return ncclInvalidUsage;
+  }
+  size_t bytes = MAX_REQUESTS*sizeof(struct ncclNetFlowHdr);
+  NCCLCHECK(ncclIbMalloc((void**)&comm->flowHdrs, bytes));
+  for (int i = 0; i < comm->base.ndevs; i++) {
+    NCCLCHECK(wrap_ibv_reg_mr(&comm->devs[i].flowHdrMr, comm->devs[i].base.pd, comm->flowHdrs, bytes, IBV_ACCESS_LOCAL_WRITE));
+  }
+  comm->flowHdrData = data;
+  INFO(NCCL_NET, "NET/IB: flow headers on: %d-byte header + %d data bytes per fragment (fragSize %d)%s",
+       hdrSize, data, comm->fragSize,
+       ncclParamIbFlowHdrTestMisorder() ? " -- TEST MISORDER: fragments posted first to last, data WILL be corrupted" : "");
+  return ncclSuccess;
+}
+
 static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
   int64_t fragParam = ncclParamIbFragSize();
-  if (fragParam == 0) return ncclSuccess;
+  // With flow headers on, every way of ending up unfragmented is an error: a
+  // send without fragments carries no headers, and nothing else would say so.
+  bool flowHdr = ncclParamMscclFlowId() != 0;
+  if (fragParam == 0) {
+    if (flowHdr) {
+      WARN("NET/IB: NCCL_MSCCL_FLOW_ID needs MTU fragmentation to put a header in every packet; set NCCL_IB_FRAG_SIZE");
+      return ncclInvalidUsage;
+    }
+    return ncclSuccess;
+  }
 
   int fragSize;
   if (fragParam > 0) {
@@ -1227,7 +1296,7 @@ static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
   fragSize = (fragSize/128)*128;
   if (fragSize < 128) {
     WARN("NET/IB: NCCL_IB_FRAG_SIZE=%ld resolves to %d bytes, too small to fragment; disabling", (long)fragParam, fragSize);
-    return ncclSuccess;
+    return flowHdr ? ncclInvalidUsage : ncclSuccess;
   }
 
   // A pass can never post more WRs than the shallowest send queue holds, so the
@@ -1238,14 +1307,15 @@ static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
   }
   if (cap < NCCL_NET_IB_MAX_RECVS + 1) {
     WARN("NET/IB: send queue depth %d too small to fragment; disabling", cap);
-    return ncclSuccess;
+    return flowHdr ? ncclInvalidUsage : ncclSuccess;
   }
 
   int batch = (int)ncclParamIbFragBatch();
   if (batch < 1) batch = 1;
 
   NCCLCHECK(ncclIbMalloc((void**)&comm->fragWrs, cap*sizeof(struct ibv_send_wr)));
-  NCCLCHECK(ncclIbMalloc((void**)&comm->fragSges, cap*sizeof(struct ibv_sge)));
+  // Two SGEs per WR: a headed fragment is [flow header][payload].
+  NCCLCHECK(ncclIbMalloc((void**)&comm->fragSges, 2*cap*sizeof(struct ibv_sge)));
   NCCLCHECK(ncclCalloc(&comm->sqCredit, comm->base.nqps));
   for (int q = 0; q < comm->base.nqps; q++) {
     NCCLCHECK(ncclCalloc(&comm->sqCredit[q].pending, MAX_REQUESTS));
@@ -1256,6 +1326,7 @@ static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
   comm->fragCap = cap;
   INFO(NCCL_NET, "NET/IB: MTU fragmentation on: fragSize=%d batch=%d sqDepth=%d nqps=%d",
       fragSize, batch, cap, comm->base.nqps);
+  if (flowHdr) NCCLCHECK(ncclIbSetupFlowHdr(comm));
   return ncclSuccess;
 }
 
@@ -1798,6 +1869,8 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
   assert(size > 0);
   struct ncclIbNetCommBase* base = (struct ncclIbNetCommBase*) comm;
   struct ncclIbMrHandle* mhandleWrapper = (struct ncclIbMrHandle*) malloc(sizeof(struct ncclIbMrHandle));
+  if (mhandleWrapper == NULL) return ncclSystemError;
+  mhandleWrapper->headroom = 0;
   for (int i = 0; i < base->ndevs; i++) {
     // Each ncclIbNetCommDevBase is at different offset in send and recv netComms
     struct ncclIbNetCommDevBase* devComm = ncclIbGetNetCommDevBase(base, i);
@@ -2026,19 +2099,31 @@ static ncclResult_t ncclIbMultiSendFrag(struct ncclIbSendComm* comm, int slot) {
     int budget = qp->sqDepth - credit->outstanding - 1;
     if (budget > comm->fragCap - 1) budget = comm->fragCap - 1;
 
+    // A request gets flow headers when they are on and its receiver reserved
+    // room for one before the buffer. Its fragments then carry flowHdrData bytes
+    // of payload instead of fragSize, so that header + payload is one packet.
+    const int hdrSize = sizeof(struct ncclNetFlowHdr);
+    bool headed[NCCL_NET_IB_MAX_RECVS];
+    int fragData[NCCL_NET_IB_MAX_RECVS];
+    for (int r=0; r<nreqs; r++) {
+      headed[r] = comm->flowHdrData > 0 && slots[r].headroom >= (uint32_t)hdrSize;
+      fragData[r] = headed[r] ? comm->flowHdrData : comm->fragSize;
+    }
+
     // Fragment only if every fragment can be a full comm->fragSize. Otherwise
-    // post one WR per slice, exactly as ncclIbMultiSend would.
-    int fragSize = comm->fragSize;
+    // post one WR per slice, exactly as ncclIbMultiSend would (and without
+    // flow headers: they ride on fragments).
+    bool fragment = true;
     int64_t nFrags = 0;
-    for (int r=0; r<nreqs; r++) nFrags += DIVUP(lengths[r], fragSize);
+    for (int r=0; r<nreqs; r++) nFrags += DIVUP(lengths[r], fragData[r]);
     if (nFrags > budget) {
       if (comm->fragWarned == 0) {
         comm->fragWarned = 1;
         WARN("NET/IB: %ld fragments needed for %ld bytes but only %d send queue slots free; "
-             "posting unfragmented. Raise NCCL_IB_SEND_QUEUE_DEPTH (currently %d) to fragment transfers this large.",
-             (long)nFrags, (long)totalBytes, budget, qp->sqDepth);
+             "posting unfragmented%s. Raise NCCL_IB_SEND_QUEUE_DEPTH (currently %d) to fragment transfers this large.",
+             (long)nFrags, (long)totalBytes, budget, comm->flowHdrData ? " and without flow headers" : "", qp->sqDepth);
       }
-      fragSize = 0; // one WR per slice
+      fragment = false; // one WR per slice
     }
 
     int nwr = 0;
@@ -2046,26 +2131,50 @@ static ncclResult_t ncclIbMultiSendFrag(struct ncclIbSendComm* comm, int slot) {
       if (lengths[r] == 0) continue; // contribute no WRs, unlike the 0-byte WR
                                      // ncclIbMultiSend needs for its fixed chain
       int base = reqs[r]->send.offset;
-      int step = fragSize > 0 ? fragSize : lengths[r];
-      for (int off = 0; off < lengths[r]; off += step) {
+      int step = fragment ? fragData[r] : lengths[r];
+      bool hdr = fragment && headed[r];
+      // The header of a fragment at offset off lands in [off - hdrSize, off):
+      // the tail of the fragment before it, or the receiver's pad for the
+      // first one. Posting the fragments last to first makes every header but
+      // the first get overwritten by that earlier fragment's data, because an
+      // RC QP places writes in posting order (given ordered PCIe writes, which
+      // is why relaxed ordering is off). It only holds within one pass: base
+      // must be 0, which ncclIbSetupFlowHdr guarantees by allowing one pass.
+      if (hdr && base != 0) {
+        WARN("NET/IB: flow header on a send pass at offset %d; only single-pass sends can carry headers", base);
+        return ncclInternalError;
+      }
+      int nfrag = DIVUP(lengths[r], step);
+      struct ncclNetFlowHdr* hdrBuf = comm->flowHdrs ? comm->flowHdrs + (reqs[r] - comm->base.reqs) : NULL;
+      for (int f = 0; f < nfrag; f++) {
         if (nwr >= comm->fragCap - 1) {
           WARN("NET/IB: fragment WR arena overflow (cap %d)", comm->fragCap);
           return ncclInternalError;
         }
+        bool descending = hdr && !ncclParamIbFlowHdrTestMisorder();
+        int off = (descending ? nfrag-1-f : f) * step;
         int flen = std::min(step, lengths[r] - off);
-        struct ibv_sge* sge = comm->fragSges + nwr;
+        struct ibv_sge* sge = comm->fragSges + 2*nwr;
         struct ibv_send_wr* wr = comm->fragWrs + nwr;
         memset(wr, 0, sizeof(struct ibv_send_wr));
+        int nsge = 0;
+        if (hdr) {
+          sge[nsge].addr   = (uintptr_t)hdrBuf;
+          sge[nsge].length = hdrSize;
+          sge[nsge].lkey   = comm->devs[devIndex].flowHdrMr->lkey;
+          nsge++;
+        }
         // Absolute addressing: send.offset is the per-pass cursor, off the
         // per-fragment one. Equivalent to the incremental scheme in
         // ncclIbMultiSend, which advances both ends by chunkSize per pass.
-        sge->addr   = (uintptr_t)reqs[r]->send.data + base + off;
-        sge->length = flen;
-        sge->lkey   = reqs[r]->send.lkeys[devIndex];
+        sge[nsge].addr   = (uintptr_t)reqs[r]->send.data + base + off;
+        sge[nsge].length = flen;
+        sge[nsge].lkey   = reqs[r]->send.lkeys[devIndex];
+        nsge++;
         wr->opcode  = IBV_WR_RDMA_WRITE;
         wr->sg_list = sge;
-        wr->num_sge = 1;
-        wr->wr.rdma.remote_addr = slots[r].addr + base + off;
+        wr->num_sge = nsge;
+        wr->wr.rdma.remote_addr = slots[r].addr + base + off - (hdr ? hdrSize : 0);
         wr->wr.rdma.rkey        = slots[r].rkeys[qp->remDevIdx];
         wr->send_flags = 0;
         nwr++;
@@ -2170,6 +2279,13 @@ static ncclResult_t ncclIbIsendImpl(void* sendComm, void* data, int size, int ta
     req->send.data = data;
     req->send.offset = 0;
     req->send.flowId = meta ? meta->flowId : 0;
+    // The request owns its header slot until it is freed, after the completion
+    // that also covers every fragment's read of it.
+    if (comm->flowHdrData) {
+      struct ncclNetFlowHdr* hdr = comm->flowHdrs + (req - comm->base.reqs);
+      hdr->magic = htonl(NCCL_NET_FLOW_HDR_MAGIC);
+      hdr->flowId = htonl(req->send.flowId);
+    }
 
     // Populate events
     int nEvents = ncclParamIbSplitDataOnQps() ? comm->base.nqps : comm->base.ndevs;
@@ -2226,8 +2342,15 @@ static ncclResult_t ncclIbIsendMeta(void* sendComm, void* data, int size, int ta
   return ncclIbIsendImpl(sendComm, data, size, tag, mhandle, meta, request);
 }
 
+static ncclResult_t ncclIbSetMrHeadroom(void* mhandle, int bytes) {
+  if (mhandle == NULL || bytes < 0) return ncclInternalError;
+  ((struct ncclIbMrHandle*)mhandle)->headroom = bytes;
+  return ncclSuccess;
+}
+
 ncclNetMscclExt_t ncclNetIbMscclExt = {
   ncclIbIsendMeta,
+  ncclIbSetMrHeadroom,
 };
 
 ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
@@ -2256,6 +2379,7 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
     localElem[i].size = sizes[i]; // Sanity/Debugging
     localElem[i].tag = tags[i];
     localElem[i].idx = comm->remFifo.fifoTail+1;
+    localElem[i].headroom = mhandleWrapper->headroom;
   }
   wr.wr.rdma.remote_addr = comm->remFifo.addr + slot*NCCL_NET_IB_MAX_RECVS*sizeof(struct ncclIbSendFifo);
 
@@ -2515,6 +2639,7 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
     for (int i = 0; i < comm->base.ndevs; i++) {
       struct ncclIbSendCommDev* commDev = comm->devs + i;
       if (commDev->fifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->fifoMr));
+      if (commDev->flowHdrMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->flowHdrMr));
       if (comm->remSizesFifo.mrs[i] != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->remSizesFifo.mrs[i]));
       NCCLCHECK(ncclIbDestroyBase(&commDev->base));
     }
@@ -2524,6 +2649,7 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
     }
     free(comm->fragWrs);
     free(comm->fragSges);
+    free(comm->flowHdrs);
     free(comm);
   }
   TIME_PRINT("IB");

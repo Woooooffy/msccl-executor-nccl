@@ -17,6 +17,7 @@
 #include "transport.h"
 #include "shm.h"
 #include "msccl/msccl_lifecycle.h"
+#include <arpa/inet.h> // ntohl, for the flow header debug check
 
 #if defined(ENABLE_NPKIT)
 #include "npkit/npkit.h"
@@ -104,6 +105,11 @@ struct connectMap {
   int sameProcess;
   int shared;
   int cudaDev;
+  // Receive side only: bytes reserved before each Simple slot for the flow
+  // header (0 = stock layout). The Simple buffer is then NCCL_STEPS slots of
+  // [pad][stepSize], and buffs[SIMPLE] still points at the start of the
+  // allocation, i.e. at slot 0's pad.
+  int flowHdrPad;
   // First 3 bits of offsets determine the mem bank. 001 is host mem, 011 is dev mem, 101 is shared host mem and 111 is shared dev mem.
   struct connectMapMem mems[NCCL_NET_MAP_MEMS];
   // Offsets. 3 MSBs indicate mem bank, 111 indicates NULL.
@@ -188,10 +194,13 @@ static ncclResult_t canConnect(int* ret, struct ncclComm* comm, struct ncclTopoG
 NCCL_PARAM(NetSharedBuffers, "NET_SHARED_BUFFERS", -2);
 NCCL_PARAM(NetSharedComms, "NET_SHARED_COMMS", 1);
 // Pass each send's MSCCL flow id (XML mscclflowid, stamped per slot by the GPU)
-// down to the net. Requires the built-in IB transport.
-//   0 off, plain isend
-//   1 on
-//   2 on, and log every send's (rank, peer, channel, size, flow id) at INFO/NET
+// down to the net, which puts it in a header at the start of every fragment.
+// Requires the built-in IB transport with fragmentation on (NCCL_IB_FRAG_SIZE).
+//   0 off, plain isend and stock receive buffers
+//   1 on: flow ids, flow headers, and a NCCL_NET_FLOW_HDR_PAD before each
+//     Simple receive slot for the header to land in
+//   2 as 1, and log at INFO/NET every send's flow id and, when the receive
+//     buffer is in host memory, the header each receive found in its pad
 NCCL_PARAM(MscclFlowId, "MSCCL_FLOW_ID", 0);
 
 struct setupReq {
@@ -473,7 +482,10 @@ static ncclResult_t recvConnect(struct ncclComm* comm, struct ncclConnect* conne
   struct ncclRecvMem *recvMem = (struct ncclRecvMem*) NCCL_NET_MAP_GET_POINTER(map, gpu, recvMem);
   void* gdcMem = map->mems[NCCL_NET_MAP_GDCMEM].gpuPtr;
   recv->conn.tail = gdcMem ? (uint64_t*)gdcMem : &recvMem->tail;
-  recv->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+  // With a flow header pad the GPU's slot stride grows by the pad and its slot 0
+  // starts after the first pad; the per-slot capacity, which the kernels take
+  // from comm->buffSizes, does not change.
+  recv->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS + map->flowHdrPad;
   recv->conn.connFifo = recvMem->connFifo;
   // Only fuse P2P buffers, continue to allocate dedicated buffers for ring/tree
   for (int i=0; i<NCCL_STEPS; i++) {
@@ -482,6 +494,8 @@ static ncclResult_t recvConnect(struct ncclComm* comm, struct ncclConnect* conne
 
   for (int p=0; p<NCCL_NUM_PROTOCOLS; p++)
     recv->conn.buffs[p] = NCCL_NET_MAP_GET_POINTER(map, gpu, buffs[p]);
+  if (map->flowHdrPad && recv->conn.buffs[NCCL_PROTO_SIMPLE])
+    recv->conn.buffs[NCCL_PROTO_SIMPLE] += map->flowHdrPad;
 
   if (recv->proxyConn.sameProcess) {
     if (recv->proxyConn.connection->netDeviceHandle) {
@@ -924,10 +938,25 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
   if (map->sameProcess == 0) return ncclInternalError; // We don't support remote proxy for recv
   map->shared = resources->shared;
 
+  // Flow headers land just before each Simple slot, so dedicated Simple buffers
+  // get a pad in front of every slot. Shared (p2p) buffers keep the stock
+  // layout and advertise no headroom, so senders write no header into them.
+  if (ncclParamMscclFlowId() && resources->shared == 0) {
+    if (proxyState->ncclNet != &ncclNetIb) {
+      WARN("NCCL_MSCCL_FLOW_ID requires the built-in IB transport, but net %s is in use", proxyState->ncclNet->name);
+      return ncclInvalidUsage;
+    }
+    map->flowHdrPad = NCCL_NET_FLOW_HDR_PAD;
+  }
+
   if (resources->shared == 0) { // Only allocate dedicated buffers for ring/tree, not for p2p
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
-      NCCL_NET_MAP_ADD_POINTER(map, 0, resources->useGdr, proxyState->buffSizes[p], buffs[p]);
-      resources->buffSizes[p] = proxyState->buffSizes[p];
+      // buffSizes[p]/NCCL_STEPS is the slot stride everywhere it is used on the
+      // proxy side, so the padded size keeps those computations right.
+      int size = proxyState->buffSizes[p];
+      if (p == NCCL_PROTO_SIMPLE) size += NCCL_STEPS*map->flowHdrPad;
+      NCCL_NET_MAP_ADD_POINTER(map, 0, resources->useGdr, size, buffs[p]);
+      resources->buffSizes[p] = size;
     }
   } else {
     // Get shared buffers
@@ -992,6 +1021,12 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
 #endif
       {
         NCCLCHECK(proxyState->ncclNet->regMr(resources->netRecvComm, resources->buffers[p], resources->buffSizes[p], NCCL_NET_MAP_DEV_MEM(map, buffs[p]) ? NCCL_PTR_CUDA : NCCL_PTR_HOST, &resources->mhandles[p]));
+      }
+      // Tell the sender, through every receive posted on this buffer, that the
+      // pad in front of the slot is its to write. The registration covers the
+      // whole allocation, slot 0's pad included.
+      if (p == NCCL_PROTO_SIMPLE && map->flowHdrPad) {
+        NCCLCHECK(ncclNetIbMscclExt.setMrHeadroom(resources->mhandles[p], map->flowHdrPad));
       }
 
       // Copy the mhandle dptr
@@ -1353,6 +1388,15 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
   return ncclSuccess;
 }
 
+// Start of a dedicated (unshared) receive slot's data. A Simple slot is
+// [flowHdrPad][data] when flow headers are on, so its data starts after the pad.
+static char* recvSlotData(struct recvNetResources* resources, int p, int buffSlot) {
+  int stepSize = resources->buffSizes[p] / NCCL_STEPS;
+  char* localBuff = NCCL_NET_MAP_GET_POINTER(&resources->map, cpu, buffs[p]);
+  int pad = (p == NCCL_PROTO_SIMPLE) ? resources->map.flowHdrPad : 0;
+  return localBuff + pad + buffSlot*stepSize;
+}
+
 static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_NET_COLLECT_POLL_CNT)
   g_npkit_net_poll_cnt++;
@@ -1438,8 +1482,14 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               ptrs[subCount] = localBuff+offset;
             }
           } else {
-            ptrs[subCount] = localBuff+buffSlot*stepSize;
+            ptrs[subCount] = recvSlotData(resources, p, buffSlot);
             sizes[subCount] = stepSize*args->sliceSteps;
+            // Debug: clear the pad so the header read back on completion can
+            // only be the one this receive's sender wrote. Host memory only.
+            if (ncclParamMscclFlowId() == 2 && p == NCCL_PROTO_SIMPLE && resources->map.flowHdrPad &&
+                !NCCL_NET_MAP_DEV_MEM(&resources->map, buffs[p])) {
+              memset((char*)ptrs[subCount] - resources->map.flowHdrPad, 0, resources->map.flowHdrPad);
+            }
           }
           if (sub->nbytes < sizes[subCount]) sizes[subCount] = sub->nbytes;
           tags[subCount] = resources->tpRemoteRank;
@@ -1549,6 +1599,19 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
 
             if (sub->received < sub->nsteps) {
               int size = sizes[subIndex++];
+              // Debug: fragment 0 is posted last, so once the receive is done its
+              // header is in the pad and every other header has been overwritten.
+              struct recvNetResources* hdrRes = (struct recvNetResources*) (sub->connection->transportResources);
+              if (ncclParamMscclFlowId() == 2 && size > 0 && p == NCCL_PROTO_SIMPLE && !sub->reg &&
+                  hdrRes->map.flowHdrPad && !hdrRes->shared && !NCCL_NET_MAP_DEV_MEM(&hdrRes->map, buffs[p])) {
+                int buffSlot = (sub->base+sub->received)%NCCL_STEPS;
+                const volatile struct ncclNetFlowHdr* hdr = (const volatile struct ncclNetFlowHdr*)
+                  (recvSlotData(hdrRes, p, buffSlot) - sizeof(struct ncclNetFlowHdr));
+                uint32_t magic = ntohl(hdr->magic), flowId = ntohl(hdr->flowId);
+                INFO(NCCL_NET, "MSCCL flowid recv: rank %d <- %d channel %d slot %d size %d magic %s flowId %u",
+                     hdrRes->tpRank, hdrRes->tpRemoteRank, sub->channelId, buffSlot, size,
+                     magic == NCCL_NET_FLOW_HDR_MAGIC ? "ok" : "MISSING", flowId);
+              }
               if (sub->reg) {
                 if (size < sub->nbytes) {
                   sub->recvbuff += size;
@@ -1591,12 +1654,11 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
                 struct ncclProxySubArgs* sub = subGroup + i;
                 if (step < sub->nsteps) {
                   struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
-                  int stepSize = resources->buffSizes[p] / NCCL_STEPS;
                   char* localBuff = NCCL_NET_MAP_GET_POINTER(&resources->map, cpu, buffs[p]);
                   int buffSlot = (sub->base+sub->received-args->sliceSteps)%NCCL_STEPS;
                   ptrs[subCount] = resources->shared ?
                     (sub->reg ? (char*)sub->recvbuff : localBuff+resources->recvMem->connFifo[buffSlot].offset) :
-                    localBuff+buffSlot*stepSize;
+                    recvSlotData(resources, p, buffSlot);
                   mhandles[subCount] = sub->mhandle;
                   subCount++;
                 }

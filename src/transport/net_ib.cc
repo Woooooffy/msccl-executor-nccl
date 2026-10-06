@@ -1229,6 +1229,8 @@ ncclResult_t ncclIbRtsQp(struct ibv_qp* qp) {
 // Called once per send comm, after the QPs exist and remDevs (and therefore the
 // negotiated path MTU) are known. Leaves comm->fragSize == 0, i.e. stock
 // behaviour, if fragmentation is off or cannot be configured.
+int64_t ncclParamIbSplitDataOnQps(); // NCCL_PARAM below, with the multi-send code
+
 // Flow headers: one per in-flight request, registered on every device so a
 // fragment's header SGE has a valid lkey whichever QP carries it.
 static ncclResult_t ncclIbSetupFlowHdr(struct ncclIbSendComm* comm) {

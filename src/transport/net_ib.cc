@@ -112,7 +112,13 @@ NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
 //   NCCL_IB_FRAG_SIZE         0  disabled (stock single-WR behaviour)
 //                            -1  use the negotiated path MTU
 //                            >0  explicit fragment size in bytes
-//   NCCL_IB_FRAG_BATCH        k: WRs chained per ibv_post_send doorbell
+//   NCCL_IB_FRAG_BATCH        k: WRs chained per ibv_post_send doorbell.
+//                             0 = chain the whole transfer behind ONE doorbell,
+//                             which is the minimum-doorbell configuration and
+//                             the default. Fragmenting for a per-packet header
+//                             needs only the WR/SGE split, not extra doorbells;
+//                             k>0 exists for pacing, which is what actually
+//                             requires spacing the posts out in time.
 //   NCCL_IB_SEND_QUEUE_DEPTH  send queue depth to request, 0 = auto
 //
 // Fragmentation is all-or-nothing per pass: every fragment is exactly
@@ -121,7 +127,7 @@ NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
 // send queue budget it is posted unfragmented rather than with coarser
 // fragments, and says so, so the invariant is never silently weakened.
 NCCL_PARAM(IbFragSize, "IB_FRAG_SIZE", 0);
-NCCL_PARAM(IbFragBatch, "IB_FRAG_BATCH", 2);
+NCCL_PARAM(IbFragBatch, "IB_FRAG_BATCH", 0);
 NCCL_PARAM(IbSendQueueDepth, "IB_SEND_QUEUE_DEPTH", 0);
 // TEST ONLY. Posts headed fragments first to last, so each header overwrites
 // the tail of the fragment before it and the data is corrupted. Exists to show
@@ -1312,8 +1318,11 @@ static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
     return flowHdr ? ncclInvalidUsage : ncclSuccess;
   }
 
+  // batch <= 0 means "one doorbell for the whole transfer". nwr can never
+  // exceed cap, so setting the batch to cap makes the posting loop run exactly
+  // once without needing a special case in it.
   int batch = (int)ncclParamIbFragBatch();
-  if (batch < 1) batch = 1;
+  if (batch < 1) batch = cap;
 
   NCCLCHECK(ncclIbMalloc((void**)&comm->fragWrs, cap*sizeof(struct ibv_send_wr)));
   // Two SGEs per WR: a headed fragment is [flow header][payload].
@@ -1326,8 +1335,8 @@ static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
   comm->fragSize = fragSize;
   comm->fragBatch = batch;
   comm->fragCap = cap;
-  INFO(NCCL_NET, "NET/IB: MTU fragmentation on: fragSize=%d batch=%d sqDepth=%d nqps=%d",
-      fragSize, batch, cap, comm->base.nqps);
+  INFO(NCCL_NET, "NET/IB: MTU fragmentation on: fragSize=%d batch=%d%s sqDepth=%d nqps=%d",
+      fragSize, batch, batch >= cap ? " (single doorbell)" : "", cap, comm->base.nqps);
   if (flowHdr) NCCLCHECK(ncclIbSetupFlowHdr(comm));
   return ncclSuccess;
 }
@@ -2041,8 +2050,9 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
 //  - each request's slice is split into comm->fragSize chunks, one WR each,
 //    so that a WR maps to a single wire packet;
 //  - the chain is cut into batches of comm->fragBatch WRs, each posted with its
-//    own ibv_post_send, so doorbells are spaced through the transfer rather
-//    than all data riding on one;
+//    own ibv_post_send. With the default fragBatch (0 -> cap) the whole
+//    transfer rides one doorbell, exactly as stock does; k>0 spaces the posts
+//    out, which is only wanted for pacing;
 //  - the WR list is rebuilt per pass instead of being built once and mutated,
 //    because the WR count now varies per pass and per request;
 //  - the trailing IMM WR is always separate. Every fragment is then a plain

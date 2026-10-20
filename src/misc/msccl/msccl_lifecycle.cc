@@ -20,6 +20,7 @@
 #include "graph/topo.h"
 
 #include "msccl/msccl_lifecycle.h"
+#include "msccl/msccl_netgate.h"
 #include "msccl/msccl_parser.h"
 #include "msccl/msccl_setup.h"
 #include "msccl/msccl_status.h"
@@ -541,6 +542,7 @@ ncclResult_t mscclTeardown() {
     }
     mscclStatus& status = mscclGetStatus();
     for (auto &p : status.hostAlgos) {
+      mscclNetGateFree(p.second);
       free(p.second);
       status.freeAlgoHandles.push_back(p.first);
     }

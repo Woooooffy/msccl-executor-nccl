@@ -11,6 +11,7 @@
 
 #include "msccl/msccl_lifecycle.h"
 #include "msccl/msccl_kernel.h"
+#include "msccl/msccl_netgate.h"
 #include "msccl/msccl_setup.h"
 #include "msccl/msccl_status.h"
 
@@ -121,6 +122,9 @@ ncclResult_t mscclSetupConnections(struct mscclAlgo* hostAlgo, ncclComm_t comm) 
   status.needsProxy |= needsProxy;
   mscclClearIsCallerFlag();
 
+  // Net gates need the connections above: they resolve each gate's ends to them.
+  NCCLCHECK(mscclNetGateBind(hostAlgo, comm));
+
   return ncclSuccess;
 }
 
@@ -141,6 +145,8 @@ static ncclResult_t mscclSetupProxyImpl(struct mscclAlgo* hostAlgo, ncclComm_t c
   proxyOp.opCount = comm->sharedRes->collOpCount;
   int nLoops = (int)(DIVUP(status.nBytes, (size_t)((size_t)hostAlgo->nChunksPerLoop*(size_t)status.chunkEffectiveSize)));
   int nLoopsChunkSteps = nLoops * status.chunkSteps;
+  const struct mscclNetGateLowered* netGates = NULL;
+  NCCLCHECK(mscclNetGateLower(hostAlgo, comm, status.maxAllowedCount, status.chunkSteps, status.sliceSteps, &netGates));
   for (int ch = 0; ch < hostAlgo->nChannels; ch++) {
     proxyOp.channelId = ch;
     struct mscclChannelInfo* mscclChannel = hostAlgo->mscclChannels + ch;
@@ -154,6 +160,7 @@ static ncclResult_t mscclSetupProxyImpl(struct mscclAlgo* hostAlgo, ncclComm_t c
         nRecvs += recvPeer->nTransmissionsOfCount[c] * nStepsInCount;
       }
       proxyOp.nsteps = nLoopsChunkSteps * nRecvs;
+      proxyOp.netGate = NULL; // proxyOp is reused for every save in this function
       if (proxyOp.nsteps > 0) {
         NCCLCHECK(mscclSaveProxy(comm, ncclChannel, proxyRecv, recvPeer->peer, &proxyOp, 0));
       }
@@ -167,6 +174,10 @@ static ncclResult_t mscclSetupProxyImpl(struct mscclAlgo* hostAlgo, ncclComm_t c
         nSends += sendPeer->nTransmissionsOfCount[c] * nStepsInCount;
       }
       proxyOp.nsteps = nLoopsChunkSteps * nSends;
+      // Only threadblocks that wait or are waited on get the pointer. Those are
+      // network sends served by this GPU's proxy (mscclNetGateBind); any other
+      // op may run in another process, where the pointer means nothing.
+      proxyOp.netGate = (netGates && netGates->involved[sendPeer->bid]) ? &netGates->ops[sendPeer->bid] : NULL;
       if (proxyOp.nsteps > 0) {
         NCCLCHECK(mscclSaveProxy(comm, ncclChannel, proxySend, sendPeer->peer, &proxyOp, 0));
       }

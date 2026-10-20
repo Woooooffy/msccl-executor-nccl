@@ -38,6 +38,7 @@ typedef enum : uint8_t {
 enum ncclProxyOpState { ncclProxyOpNone, ncclProxyOpReady, ncclProxyOpProgress };
 
 struct ncclProxyArgs;
+struct mscclNetGateOp;
 typedef ncclResult_t (*proxyProgressFunc_t)(struct ncclProxyState*, struct ncclProxyArgs*);
 
 #define NCCL_PROXY_MAX_SUBS MAXCHANNELS
@@ -87,6 +88,11 @@ struct ncclProxyOp {
   int peer;
   pid_t pid;
   void* profilerContext;
+
+  // MSCCL net gates (msccl/msccl_netgate.h). NULL: this op neither publishes
+  // its progress nor waits. Points into host memory of the rank that posted
+  // the op, so it is only set for ops served by that rank's own proxy.
+  const struct mscclNetGateOp* netGate;
 
   struct ncclProxyOp *enqNext;
 };
@@ -139,6 +145,12 @@ struct ncclProxySubArgs {
 #endif
   void* recvRequestsCache[NCCL_STEPS];
   int recvRequestsSubCount;
+
+  // MSCCL net gates: copied from ncclProxyOp::netGate. netGateClosedSince is
+  // when a gate started holding back a ready send (clockNano, 0 = not held).
+  const struct mscclNetGateOp* netGate;
+  uint64_t netGateClosedSince;
+  bool netGateWarned;
 };
 
 struct ncclProxyArgs {

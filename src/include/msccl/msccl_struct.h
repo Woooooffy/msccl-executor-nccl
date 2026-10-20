@@ -75,6 +75,7 @@ struct mscclFlag {
 
 struct mscclChannelPeerInfo {
   int peer;
+  int bid; // threadblock that owns this peer entry
   // nTransmissionsOfCount[i]: number of transmissions with count i (in terms of msccl chunks)
   int nTransmissionsOfCount[MSCCL_MAX_COUNT + 1];
   int existingCounts[MSCCL_MAX_COUNT + 1];
@@ -146,6 +147,9 @@ struct mscclAlgo {
   bool inPlace;
   // Whether this algorithm is suitable for out-of-place.
   bool outOfPlace;
+  // Host only: net gates from netdepid/netdeps, NULL when the XML has none.
+  // The device copy of this struct carries the pointer but never reads it.
+  struct mscclNetGateInfo* netGates;
 };
 
 enum mscclGroupStatus {

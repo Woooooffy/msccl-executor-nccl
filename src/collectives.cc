@@ -74,6 +74,7 @@ const char* ncclProtoToString(int proto) {
   }
 }
 #include "msccl/msccl_lifecycle.h"
+#include "msccl/msccl_netgate.h"
 #include "msccl/msccl_parser.h"
 #include "msccl/msccl_setup.h"
 #include "msccl/msccl_status.h"
@@ -367,6 +368,7 @@ NCCL_API(ncclResult_t, mscclUnloadAlgo, mscclAlgoHandle_t mscclAlgoHandle);
 ncclResult_t mscclUnloadAlgo(mscclAlgoHandle_t mscclAlgoHandle) {
   mscclStatus& status = mscclGetStatus();
 
+  mscclNetGateFree(status.hostAlgos[mscclAlgoHandle]);
   free(status.hostAlgos[mscclAlgoHandle]);
   status.hostAlgos.erase(mscclAlgoHandle);
 

@@ -374,6 +374,9 @@ static ncclResult_t ncclProxyOpToArgs(struct ncclProxyOp* op, struct ncclProxyAr
   sub->eActivationMask = op->eActivationMask;
   sub->taskEventHandle = op->taskEventHandle;
   sub->rank = op->rank;
+  sub->netGate = op->netGate;
+  sub->netGateClosedSince = 0;
+  sub->netGateWarned = false;
   args->pid = op->pid;
   args->profilerContext = op->profilerContext;
   args->nsubs = subIndex+1;

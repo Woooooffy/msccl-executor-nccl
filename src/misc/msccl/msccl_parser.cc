@@ -11,9 +11,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <algorithm>
+#include <vector>
 #include "core.h"
 #include "collectives.h"
 #include "msccl/msccl_parser.h"
+#include "msccl/msccl_netgate.h"
 
 ncclResult_t mscclXmlGetChar(FILE* file, char* c) {
   if (fread(c, 1, 1, file) == 0) {
@@ -139,7 +142,9 @@ ncclResult_t mscclXmlGetNode(FILE* file, struct mscclXmlNode* node) {
   while (c == ' ') {
     NCCLCHECK(mscclXmlGetToken(file, node->attrs[a].key, node->attrs[a].value, &c));
     if (a == MAX_ATTR_COUNT) {
-      INFO(NCCL_GRAPH, "XML Parse : Ignoring extra attributes (max %d)", MAX_ATTR_COUNT);
+      // Loud on purpose: a dropped attribute such as netdepid or mscclflowid
+      // silently changes what the algorithm does.
+      WARN("XML Parse : node %s has more than %d attributes; ignoring the extra ones", node->name, MAX_ATTR_COUNT);
       // Actually we need to still consume the extra attributes so we have an extra one.
     } else a++;
   }
@@ -301,6 +306,166 @@ ncclResult_t mscclProtocolStrToId(const char *protocol, int *protocolId) {
   return ncclSuccess;
 }
 
+// A netdepid/netdeps pair as read from the XML. Steps are document positions
+// within the threadblock, which is also the kernel's step counter.
+struct mscclNetGateRaw {
+  int bid, pos, depBid, depPos;
+};
+
+static bool mscclIsSendType(uint8_t type) {
+  return type == MSCCL_SEND || type == MSCCL_RECV_COPY_SEND ||
+         type == MSCCL_RECV_REDUCE_SEND || type == MSCCL_RECV_REDUCE_COPY_SEND;
+}
+
+// Transmission at XML position `pos` of threadblock `bid` if it is a send that
+// moves data (cnt > 0), else -1. A nop maps to -1.
+static int mscclNetGateSendTran(struct mscclAlgo* algo, const std::vector<std::vector<int16_t>>& stepToTran, int bid, int pos) {
+  if (bid < 0 || bid >= algo->nBlocks || pos < 0 || pos >= (int)stepToTran[bid].size()) return -1;
+  int tran = stepToTran[bid][pos];
+  if (tran < 0) return -1;
+  struct mscclTransmission* t = &algo->mscclTBs[bid].transmissions[tran];
+  return (mscclIsSendType(t->type) && t->count > 0) ? tran : -1;
+}
+
+// Transmission that completes the kernel's step counter value `pos` in `bid`:
+// the one at that position, or the next real one after a nop. -1 if none.
+static int mscclTranAtOrAfter(const std::vector<std::vector<int16_t>>& stepToTran, int bid, int pos) {
+  if (pos < 0) return -1;
+  for (int p = pos; p < (int)stepToTran[bid].size(); p++) {
+    if (stepToTran[bid][p] >= 0) return stepToTran[bid][p];
+  }
+  return -1;
+}
+
+// A gate can deadlock the proxy; a data dependency can deadlock the kernel. Reject a
+// cycle over (threadblock program order) + (depid/deps) + (net gates) on this GPU.
+// Every edge is within one pass or points forward, so one pass is enough.
+// Cycles that cross GPUs through the receivers' buffers are not visible here.
+static ncclResult_t mscclCheckNetGatesAcyclic(struct mscclAlgo* algo, int rank,
+    const std::vector<std::vector<int16_t>>& stepToTran, const std::vector<struct mscclNetGateSpec>& specs) {
+  int nBlocks = algo->nBlocks;
+  std::vector<int> base(nBlocks + 1, 0);
+  for (int b = 0; b < nBlocks; b++) base[b+1] = base[b] + algo->mscclTBs[b].nSteps;
+  int nNodes = base[nBlocks];
+  std::vector<std::vector<int>> succ(nNodes);
+  for (int b = 0; b < nBlocks; b++) {
+    struct mscclThreadBlock* tb = &algo->mscclTBs[b];
+    for (int i = 0; i < tb->nSteps; i++) {
+      if (i + 1 < tb->nSteps) succ[base[b]+i].push_back(base[b]+i+1);
+      struct mscclTransmission* t = &tb->transmissions[i];
+      for (int d = t->dependencePointer; d < t->dependencePointer + t->numDependencies; d++) {
+        int dBid = tb->dependentBid[d];
+        if (dBid < 0 || dBid >= nBlocks) continue;
+        int dTran = mscclTranAtOrAfter(stepToTran, dBid, tb->dependentStep[d]);
+        if (dTran >= 0) succ[base[dBid]+dTran].push_back(base[b]+i);
+      }
+    }
+  }
+  for (auto& g : specs) succ[base[g.depBid]+g.depTran].push_back(base[g.bid]+g.tran);
+
+  // Iterative DFS; on a back edge, print the cycle.
+  std::vector<uint8_t> color(nNodes, 0); // 0 unvisited, 1 on stack, 2 done
+  std::vector<std::pair<int, size_t>> stack;
+  for (int root = 0; root < nNodes; root++) {
+    if (color[root]) continue;
+    color[root] = 1;
+    stack.push_back({root, 0});
+    while (!stack.empty()) {
+      int node = stack.back().first;
+      size_t& next = stack.back().second;
+      if (next == succ[node].size()) {
+        color[node] = 2;
+        stack.pop_back();
+        continue;
+      }
+      int child = succ[node][next++];
+      if (color[child] == 1) {
+        char msg[1024];
+        int len = 0;
+        size_t start = 0;
+        while (stack[start].first != child) start++;
+        for (size_t s = start; s < stack.size() && len < (int)sizeof(msg) - 32; s++) {
+          int n = stack[s].first;
+          int b = std::upper_bound(base.begin(), base.end(), n) - base.begin() - 1;
+          len += snprintf(msg + len, sizeof(msg) - len, "TB %d tran %d -> ", b, n - base[b]);
+        }
+        snprintf(msg + len, sizeof(msg) - len, "...");
+        WARN("MSCCL: net gates on GPU %d would deadlock; cycle over program order, depid/deps and netdepid/netdeps: %s", rank, msg);
+        return ncclInvalidUsage;
+      }
+      if (color[child] == 0) {
+        color[child] = 1;
+        stack.push_back({child, 0});
+      }
+    }
+  }
+  return ncclSuccess;
+}
+
+// Turn the raw XML gates into transmission-space specs on algo->netGates.
+static ncclResult_t mscclResolveNetGates(struct mscclAlgo* algo, int rank, const std::vector<struct mscclNetGateRaw>& raw,
+    const std::vector<std::vector<int16_t>>& stepToTran, int sMismatchBid, int sMismatchPos, int sMismatchS) {
+  if (raw.empty()) return ncclSuccess;
+  // netdeps is the producer's step counter; resolving it by position is only
+  // right if the XML numbers its steps by position, as ncclize does.
+  if (sMismatchBid >= 0) {
+    WARN("MSCCL: GPU %d threadblock %d has s=%d at step position %d; netdepid/netdeps need s to equal the step position",
+         rank, sMismatchBid, sMismatchS, sMismatchPos);
+    return ncclInvalidUsage;
+  }
+  // Two sending threadblocks on one (channel, peer) share a connection, and the
+  // second one's proxy op runs only after the first one's retires.
+  for (int b1 = 0; b1 < algo->nBlocks; b1++) {
+    struct mscclThreadBlock* t1 = &algo->mscclTBs[b1];
+    if (t1->sendPeer < 0) continue;
+    for (int b2 = b1 + 1; b2 < algo->nBlocks; b2++) {
+      struct mscclThreadBlock* t2 = &algo->mscclTBs[b2];
+      if (t2->sendPeer == t1->sendPeer && t2->channelId == t1->channelId) {
+        WARN("MSCCL: GPU %d threadblocks %d and %d both send to %d on channel %d; net gates need one sending threadblock per connection",
+             rank, b1, b2, t1->sendPeer, t1->channelId);
+        return ncclInvalidUsage;
+      }
+    }
+  }
+
+  std::vector<struct mscclNetGateSpec> specs;
+  for (auto& r : raw) {
+    int tran = mscclNetGateSendTran(algo, stepToTran, r.bid, r.pos);
+    if (tran < 0) {
+      WARN("MSCCL: GPU %d threadblock %d step %d has netdepid, but only a send with cnt > 0 can be gated", rank, r.bid, r.pos);
+      return ncclInvalidUsage;
+    }
+    if (r.depBid < 0 || r.depBid >= algo->nBlocks || algo->mscclTBs[r.depBid].sendPeer < 0) {
+      WARN("MSCCL: GPU %d threadblock %d step %d: netdepid=%d is not a sending threadblock", rank, r.bid, r.pos, r.depBid);
+      return ncclInvalidUsage;
+    }
+    int depTran = mscclNetGateSendTran(algo, stepToTran, r.depBid, r.depPos);
+    if (depTran < 0) {
+      WARN("MSCCL: GPU %d threadblock %d step %d: netdeps=%d names threadblock %d step %d, which is not a send with cnt > 0",
+           rank, r.bid, r.pos, r.depPos, r.depBid, r.depPos);
+      return ncclInvalidUsage;
+    }
+    if (r.depBid == r.bid) {
+      INFO(NCCL_INIT, "MSCCL: GPU %d threadblock %d step %d: netdep on its own threadblock dropped; one connection is already in order",
+           rank, r.bid, r.pos);
+      continue;
+    }
+    specs.push_back({(int16_t)r.bid, (int16_t)tran, (int16_t)r.depBid, (int16_t)depTran});
+  }
+  // By (bid, tran): a threadblock's gates are contiguous and, since proxy-step
+  // offsets grow with the transmission index, sorted by atStep once lowered.
+  std::sort(specs.begin(), specs.end(), [](const struct mscclNetGateSpec& a, const struct mscclNetGateSpec& b) {
+    return a.bid != b.bid ? a.bid < b.bid : a.tran < b.tran;
+  });
+  NCCLCHECK(mscclCheckNetGatesAcyclic(algo, rank, stepToTran, specs));
+  if (specs.empty()) return ncclSuccess;
+
+  algo->netGates = new mscclNetGateInfo();
+  algo->netGates->specs = std::move(specs);
+  INFO(NCCL_INIT, "MSCCL: GPU %d: %zu net gates parsed", rank, algo->netGates->specs.size());
+  return ncclSuccess;
+}
+
 ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, int rank) {
   struct mscclXml* xml;
   NCCLCHECK(ncclCalloc(&xml, 1));
@@ -398,6 +563,11 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
       int id, nScratchChunks, nInputChunks, nOutputChunks;
       NCCLCHECK(mscclXmlGetAttrInt(node, "id", &id));
       if (id == rank) {
+        // Net gate scratch, freed when this function returns.
+        bool readNetGates = ncclParamMscclNetGates() != 0;
+        std::vector<struct mscclNetGateRaw> netGateRaw;
+        std::vector<std::vector<int16_t>> stepToTran(MSCCL_MAX_NUM_THREAD_BLOCKS); // [bid][position] -> transmission, -1 for nop
+        int sMismatchBid = -1, sMismatchPos = -1, sMismatchS = -1;
         NCCLCHECK(mscclXmlGetAttrInt(node, "i_chunks", &nInputChunks));
         NCCLCHECK(mscclXmlGetAttrInt(node, "o_chunks", &nOutputChunks));
         NCCLCHECK(mscclXmlGetAttrInt(node, "s_chunks", &nScratchChunks));
@@ -466,9 +636,12 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
             int numTransfers = 0;
             uint32_t tbSendFlowId = 0; // first send flow id seen on this thread block
             bool tbFlowIdWarned = false;
+            int stepPos = 0; // position among this threadblock's <step> nodes; the kernel's step counter
             for (int st=0; st<threadBlockNode->nSubs; st++) {
               struct mscclXmlNode* stepNode = threadBlockNode->subs[st];
               if (strcmp(stepNode->name, "step") == 0) {
+                int pos = stepPos++;
+                stepToTran[bid].push_back(-1);
                 int s, srcOffset, dstOffset, dependBid, dependStep, hasDependence, count;
                 const char* srcBuffer, * dstBuffer, * type;
                 NCCLCHECK(mscclXmlGetAttrInt(stepNode, "s", &s));
@@ -485,6 +658,26 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
                 NCCLCHECK(mscclXmlGetAttrInt(stepNode, "hasdep", &hasDependence));
                 uint32_t flowId;
                 NCCLCHECK(mscclXmlGetFlowId(stepNode, &flowId));
+                if (readNetGates) {
+                  int netDepBid = -1, netDepStep = -1;
+                  bool hasNetDepBid, hasNetDepStep;
+                  NCCLCHECK(mscclXmlGetAttrIntOpt(stepNode, "netdepid", &netDepBid, &hasNetDepBid));
+                  NCCLCHECK(mscclXmlGetAttrIntOpt(stepNode, "netdeps", &netDepStep, &hasNetDepStep));
+                  if (hasNetDepBid != hasNetDepStep) {
+                    WARN("MSCCL: GPU %d threadblock %d step %d has only one of netdepid/netdeps", id, bid, s);
+                    return ncclInvalidUsage;
+                  }
+                  if (netDepBid >= 0) {
+                    if (netDepStep < 0) {
+                      WARN("MSCCL: GPU %d threadblock %d step %d: netdepid=%d needs netdeps >= 0, got %d", id, bid, s, netDepBid, netDepStep);
+                      return ncclInvalidUsage;
+                    }
+                    netGateRaw.push_back({bid, pos, netDepBid, netDepStep});
+                  }
+                  if (s != pos && sMismatchBid < 0) {
+                    sMismatchBid = bid; sMismatchPos = pos; sMismatchS = s;
+                  }
+                }
 
                 if (s >= MSCCL_MAX_NUM_STEPS){
                   WARN("MSCCL: too many steps are requested. Max number of steps: %d, requested: %d", MSCCL_MAX_NUM_STEPS, s+1);
@@ -679,6 +872,9 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
                   }
                   mscclTran->hasDependence = hasDependence;
 
+                  // A fused reduction continuation reuses numTransfers, so it maps
+                  // to the surviving transmission.
+                  stepToTran[bid][pos] = numTransfers;
                   numTransfers++;
                   sTB->nSteps = numTransfers;
                 }
@@ -702,10 +898,12 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
 
             if (sTB->sendPeer >= 0) {
               mscclChannel->sendPeerInfo[mscclChannel->nSendPeers].peer = sTB->sendPeer;
+              mscclChannel->sendPeerInfo[mscclChannel->nSendPeers].bid = bid;
               mscclChannel->nSendPeers++;
             }
             if (sTB->recvPeer >= 0) {
               mscclChannel->recvPeerInfo[mscclChannel->nRecvPeers].peer = sTB->recvPeer;
+              mscclChannel->recvPeerInfo[mscclChannel->nRecvPeers].bid = bid;
               mscclChannel->nRecvPeers++;
             }
           }
@@ -724,6 +922,7 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
           }
         }
 
+        NCCLCHECK(mscclResolveNetGates(algo, id, netGateRaw, stepToTran, sMismatchBid, sMismatchPos, sMismatchS));
       }
     }
   }

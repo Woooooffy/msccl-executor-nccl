@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <errno.h>
+#include <limits.h>
 
 #include "msccl/msccl_struct.h"
 
@@ -85,6 +86,24 @@ static ncclResult_t mscclXmlGetAttrInt64(struct mscclXmlNode* node, const char* 
   const char* str;
   NCCLCHECK(mscclXmlGetAttrStr(node, attrName, &str));
   *value = strtoll(str, NULL, 0);
+  return ncclSuccess;
+}
+
+// Optional integer attribute. *present says whether it was there; *value is
+// only written when it was.
+static ncclResult_t mscclXmlGetAttrIntOpt(struct mscclXmlNode* node, const char* attrName, int* value, bool* present) {
+  const char* str;
+  NCCLCHECK(mscclXmlGetAttr(node, attrName, &str));
+  *present = (str != NULL);
+  if (str == NULL) return ncclSuccess;
+  char* end;
+  errno = 0;
+  long v = strtol(str, &end, 0);
+  if (end == str || *end != '\0' || errno != 0 || v < INT_MIN || v > INT_MAX) {
+    WARN("MSCCL: attribute %s=\"%s\" of node %s is not an integer", attrName, str, node->name);
+    return ncclInvalidUsage;
+  }
+  *value = (int)v;
   return ncclSuccess;
 }
 

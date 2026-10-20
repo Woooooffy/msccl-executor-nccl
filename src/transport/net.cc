@@ -17,6 +17,7 @@
 #include "transport.h"
 #include "shm.h"
 #include "msccl/msccl_lifecycle.h"
+#include "msccl/msccl_netgate.h"
 #include <arpa/inet.h> // ntohl, for the flow header debug check
 
 #if defined(ENABLE_NPKIT)
@@ -147,6 +148,13 @@ struct sendNetResources {
   ncclNetDeviceType netDeviceType;
   ncclNetDeviceHandle_t* netDeviceHandle;
   ncclNetMscclExt_t* mscclNetExt; // non-NULL iff MSCCL flow ids are passed to the net
+
+  // MSCCL net gates: progress of the op running on this connection, for gated
+  // sends on other connections of the same progress thread. Written only by
+  // that op (ops on one connection run one at a time, in post order), and only
+  // when the op carries a netGate.
+  uint64_t gateOpCount; // opCount of the last publishing op to become ready
+  uint64_t gateDone;    // that op's sub->done: proxy steps acked by the remote NIC
 };
 
 struct recvNetResources {
@@ -1134,6 +1142,61 @@ static_assert(NCCL_STEPS <= NCCL_NET_MAX_REQUESTS, "Not enough net requests to c
 static int g_npkit_net_poll_cnt = 0;
 #endif
 
+// MSCCL net gates. The gate that holds back the sub's next isend, or NULL if
+// it may go. Positions are proxy steps within one pass of the MSCCL kernel's
+// chunk loop; pass L of this op waits on pass L of the predecessor.
+static const struct mscclNetGate* netGateBlocking(struct ncclProxySubArgs* sub, struct ncclProxyArgs* args) {
+  const struct mscclNetGateOp* op = sub->netGate;
+  uint64_t k = sub->transmitted % op->stepsPerLoop;
+  uint64_t pass = sub->transmitted / op->stepsPerLoop;
+  for (int i = 0; i < op->nGates && op->gates[i].atStep <= k; i++) {
+    const struct mscclNetGate* gate = op->gates + i;
+    if (gate->atStep != k) continue;
+    const struct sendNetResources* dep = (const struct sendNetResources*)gate->depConn->transportResources;
+    // A higher opCount means the predecessor's op for this call has retired.
+    if (dep->gateOpCount > args->opCount) continue;
+    if (dep->gateOpCount < args->opCount ||                          // not started yet
+        dep->gateDone < pass * gate->depStepsPerLoop + gate->depEnd) // this pass not acked yet
+      return gate;
+  }
+  return NULL;
+}
+
+// Whether the sub's next isend, whose data is ready, may be posted now. Also
+// logs (NCCL_MSCCL_NET_GATES=2) and warns about gates that hold sends back.
+static bool netGateOpen(struct sendNetResources* resources, struct ncclProxySubArgs* sub, struct ncclProxyArgs* args) {
+  const struct mscclNetGateOp* op = sub->netGate;
+  if (op == NULL || op->nGates == 0) return true;
+  const struct mscclNetGate* gate = netGateBlocking(sub, args);
+  if (gate == NULL) {
+    if (sub->netGateClosedSince) {
+      if (ncclParamMscclNetGates() == 2) {
+        INFO(NCCL_NET, "MSCCL net gate open: rank %d -> %d channel %d TB %d pass %lu step %lu, held %.1f us",
+             resources->tpRank, resources->tpRemoteRank, sub->channelId, op->bid,
+             sub->transmitted / op->stepsPerLoop, sub->transmitted % op->stepsPerLoop,
+             (clockNano() - sub->netGateClosedSince) / 1e3);
+      }
+      sub->netGateClosedSince = 0;
+    }
+    return true;
+  }
+  uint64_t now = clockNano();
+  if (sub->netGateClosedSince == 0) {
+    sub->netGateClosedSince = now;
+  } else if (!sub->netGateWarned && ncclParamMscclNetGateWarnMs() > 0 &&
+             now - sub->netGateClosedSince > (uint64_t)ncclParamMscclNetGateWarnMs() * 1000000ULL) {
+    const struct sendNetResources* dep = (const struct sendNetResources*)gate->depConn->transportResources;
+    uint64_t pass = sub->transmitted / op->stepsPerLoop;
+    WARN("MSCCL net gate has held a ready send for over %ld ms: rank %d -> %d channel %d TB %d pass %lu step %lu (opCount %lu) "
+         "waits on TB %d reaching %lu acked steps; it has opCount %lu, %lu steps. A cycle through another GPU can cause this.",
+         ncclParamMscclNetGateWarnMs(), resources->tpRank, resources->tpRemoteRank, sub->channelId, op->bid,
+         pass, sub->transmitted % op->stepsPerLoop, args->opCount, gate->depBid,
+         pass * gate->depStepsPerLoop + gate->depEnd, dep->gateOpCount, dep->gateDone);
+    sub->netGateWarned = true;
+  }
+  return false;
+}
+
 static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_NET_COLLECT_POLL_CNT)
   g_npkit_net_poll_cnt++;
@@ -1147,6 +1210,11 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       // Set step base for next op
       resources->step = sub->base + sub->nsteps;
       sub->posted = sub->transmitted = sub->done = 0;
+      if (sub->netGate) {
+        // Publish: this connection now runs this call's op, nothing acked yet.
+        resources->gateDone = 0;
+        resources->gateOpCount = args->opCount;
+      }
       ncclProfilerStartSendProxyOpEvent(s, args);
       if (sub->reg && sub->nbytes > 0) {
         NCCLCHECK(proxyState->ncclNet->regMr(resources->netSendComm, sub->recvbuff, sub->nbytes, NCCL_PTR_CUDA, &sub->mhandle));
@@ -1234,7 +1302,9 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           } else if (p == NCCL_PROTO_SIMPLE && resources->shared) {
             buff = sub->reg ? (char*)sub->recvbuff : localBuff+resources->recvMem->connFifo[buffSlot].offset;
           }
-          if (ready) {
+          // A closed net gate declines like unready data: fall through to the
+          // completion check below, so this connection's own progress continues.
+          if (ready && netGateOpen(resources, sub, args)) {
             ncclProfilerRecordProxyOpEventState(s, args, sub->transmitted + args->sliceSteps, sub->transSize, ncclProfilerProxyOpSendRemFifoWait);
             // Data is ready, try to send.
             // Coverity complains about the size here as pointing to an out-of-scope temporary.  Which is nonsense,
@@ -1355,6 +1425,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
 
           TRACE(NCCL_NET, "sendProxy [%ld/%d] request %p done", sub->done, buffSlot, sub->requests[buffSlot]);
           sub->done += args->sliceSteps;
+          if (sub->netGate) resources->gateDone = sub->done; // publish acked progress
           ncclProfilerStopProxyStepEvents(s, args, sub->done-args->sliceSteps, sub->done);
           ncclProfilerRecordProxyOpEventState(s, args, sub->done, sub->transSize, ncclProfilerProxyOpSendDone);
 

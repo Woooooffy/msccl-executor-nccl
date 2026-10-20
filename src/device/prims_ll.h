@@ -534,8 +534,9 @@ template <int REDUCE, int COPY, int MULTISRCS, int MULTIDSTS>
   }
 
  public:
-  // MSCCL flow ids are carried for the Simple protocol only; no-op for LL
+  // MSCCL flow ids and send rates are carried for the Simple protocol only; no-op for LL
   __device__ __forceinline__ void setFlowId(uint32_t flowId) {}
+  __device__ __forceinline__ void setSendRate(uint32_t rateMBps) {}
 
   __device__  Primitives(
       const int tid, const int nthreads, int const *recvPeers, int const *sendPeers,

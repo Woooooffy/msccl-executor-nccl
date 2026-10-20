@@ -569,8 +569,9 @@ private:
   }
 
 public:
-  // MSCCL flow ids are carried for the Simple protocol only; no-op for LL128
+  // MSCCL flow ids and send rates are carried for the Simple protocol only; no-op for LL128
   __device__ __forceinline__ void setFlowId(uint32_t flowId) {}
+  __device__ __forceinline__ void setSendRate(uint32_t rateMBps) {}
 
   __device__ Primitives(
       const int tid, const int nthreads, int const *recvPeers, int const *sendPeers,

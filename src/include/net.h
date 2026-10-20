@@ -30,7 +30,8 @@ extern ncclNet_t ncclNetSocket;
 // isend has no argument for. Kept out of ncclNet_t so external plugins and the
 // plugin ABI are untouched; the proxy uses it only when ncclNet == &ncclNetIb.
 struct ncclNetSendMeta {
-  uint32_t flowId; // XML mscclflowid of this send, 0 = none
+  uint32_t flowId;   // XML mscclflowid of this send, 0 = none
+  uint32_t rateMBps; // XML rate of this send in MB/s, 0 = unpaced
 };
 typedef struct {
   // Same contract as ncclNet_t::isend, plus meta, which is copied before return.
@@ -39,12 +40,19 @@ typedef struct {
   // Declare that every receive posted on this registration has `bytes` of dead
   // memory before its address, which the sender may overwrite with a flow header.
   ncclResult_t (*setMrHeadroom)(void* mhandle, int bytes);
+  // Rate control: post whatever fragments of this comm's paced sends are due
+  // now, never waiting. *pending is 1 while fragments remain for a later call.
+  // A send's completion (test) still comes only after all of it is posted.
+  ncclResult_t (*progressSend)(void* sendComm, int* pending);
 } ncclNetMscclExt_t;
 extern ncclNetMscclExt_t ncclNetIbMscclExt;
 
 // NCCL_MSCCL_FLOW_ID (defined in transport/net.cc): 0 off, 1 flow ids and the
 // per-fragment flow header on the wire, 2 as 1 plus per-send/receive logging.
 int64_t ncclParamMscclFlowId();
+// NCCL_MSCCL_RATE (defined in transport/net.cc): 0 off, 1 pace each send at its
+// XML rate inside the IB plugin, 2 as 1 plus per-send and per-connection logs.
+int64_t ncclParamMscclRate();
 
 // Flow header carried at the start of every fragment's payload. This struct is
 // the wire format: fields are big-endian. Fragment i of a send is written to

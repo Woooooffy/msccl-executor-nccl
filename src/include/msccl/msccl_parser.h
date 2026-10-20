@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 
 #include "msccl/msccl_struct.h"
 
@@ -129,6 +130,31 @@ static ncclResult_t mscclXmlGetFlowId(struct mscclXmlNode* node, uint32_t* value
     return ncclInvalidUsage;
   }
   *value = (uint32_t)v;
+  return ncclSuccess;
+}
+
+// Optional rate attribute: the send's target rate in GB/s (1e9 bytes/s) for the
+// whole step, as ncclize emits it. Returned in MB/s, which is what the runtime
+// paces with; absent or "0" means unpaced (0).
+#define MSCCL_RATE_MAX_GBPS 4000.0
+static ncclResult_t mscclXmlGetRate(struct mscclXmlNode* node, uint32_t* rateMBps) {
+  const char* str;
+  NCCLCHECK(mscclXmlGetAttr(node, "rate", &str));
+  *rateMBps = 0;
+  if (str == NULL) return ncclSuccess;
+  char* end;
+  errno = 0;
+  double gbps = strtod(str, &end);
+  if (end == str || *end != '\0' || errno != 0 || !(gbps >= 0.0) || gbps > MSCCL_RATE_MAX_GBPS) {
+    WARN("MSCCL: rate \"%s\" is not a number of GB/s in [0, %g]", str, MSCCL_RATE_MAX_GBPS);
+    return ncclInvalidUsage;
+  }
+  long long mbps = llround(gbps * 1000.0);
+  if (gbps > 0.0 && mbps == 0) {
+    WARN("MSCCL: rate \"%s\" GB/s is below the 1 MB/s resolution the runtime paces with", str);
+    return ncclInvalidUsage;
+  }
+  *rateMBps = (uint32_t)mbps;
   return ncclSuccess;
 }
 

@@ -568,6 +568,7 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
         std::vector<struct mscclNetGateRaw> netGateRaw;
         std::vector<std::vector<int16_t>> stepToTran(MSCCL_MAX_NUM_THREAD_BLOCKS); // [bid][position] -> transmission, -1 for nop
         int sMismatchBid = -1, sMismatchPos = -1, sMismatchS = -1;
+        bool hasSendRate = false; // any of this GPU's sends carries a rate
         NCCLCHECK(mscclXmlGetAttrInt(node, "i_chunks", &nInputChunks));
         NCCLCHECK(mscclXmlGetAttrInt(node, "o_chunks", &nOutputChunks));
         NCCLCHECK(mscclXmlGetAttrInt(node, "s_chunks", &nScratchChunks));
@@ -658,6 +659,8 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
                 NCCLCHECK(mscclXmlGetAttrInt(stepNode, "hasdep", &hasDependence));
                 uint32_t flowId;
                 NCCLCHECK(mscclXmlGetFlowId(stepNode, &flowId));
+                uint32_t rateMBps;
+                NCCLCHECK(mscclXmlGetRate(stepNode, &rateMBps));
                 if (readNetGates) {
                   int netDepBid = -1, netDepStep = -1;
                   bool hasNetDepBid, hasNetDepStep;
@@ -788,6 +791,10 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
                   // The id is carried on the wire per send. On a recv-only step it
                   // names the incoming flow, which the runtime does not use.
                   sTB->sendFlowId[numTransfers] = hasSend ? flowId : 0;
+                  // Likewise the rate paces this GPU's send. ncclize also puts it on
+                  // the receiving end of a transfer, where it has no use.
+                  sTB->sendRateMBps[numTransfers] = hasSend ? rateMBps : 0;
+                  if (hasSend && rateMBps != 0) hasSendRate = true;
 
                   // A thread block sends on one (channel, peer) connection, i.e.
                   // one QP. Two ids on it mean two switch paths under one RC QP,
@@ -923,6 +930,11 @@ ncclResult_t mscclGetAlgoFromXmlFile(const char* str, struct mscclAlgo* algo, in
         }
 
         NCCLCHECK(mscclResolveNetGates(algo, id, netGateRaw, stepToTran, sMismatchBid, sMismatchPos, sMismatchS));
+        // Only the Simple protocol carries rates to the network (LL/LL128 have
+        // no per-slot stamp), so say so rather than run the XML unpaced silently.
+        if (hasSendRate && algo->protocol != NCCL_PROTO_SIMPLE) {
+          WARN("MSCCL: %s uses protocol %s; its send rates are ignored (rate control is Simple only)", str, protocol);
+        }
       }
     }
   }

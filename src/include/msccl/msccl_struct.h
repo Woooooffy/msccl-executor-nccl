@@ -59,11 +59,12 @@ struct alignas(16) mscclThreadBlock {
   int16_t dependentStep[MSCCL_MAX_NUM_STEPS]; // 512 bytes
   int16_t reductionSrcOffsets[MSCCL_MAX_NUM_STEPS]; // 512 bytes
   uint32_t sendFlowId[MSCCL_MAX_NUM_STEPS]; // XML mscclflowid of the transmission's send, 0 = none, 1024 bytes
+  uint32_t sendRateMBps[MSCCL_MAX_NUM_STEPS]; // XML rate of the transmission's send in MB/s, 0 = unpaced, 1024 bytes
   int16_t sendPeer;
   int16_t recvPeer;
   uint16_t nSteps;
   int16_t channelId; // associated channel. -1 indicates a thread block with only local copies
-}; // 6408 bytes
+}; // 7432 bytes
 
 static_assert(sizeof(struct mscclThreadBlock) % sizeof(uint64_t) == 0, "Sanity check: sizeof(struct mscclThreadBlock) \
   % sizeof(uint64_t) != 0");

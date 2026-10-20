@@ -69,7 +69,9 @@ struct ncclConnFifo {
   ssize_t size;
   void* ptr;
   uint32_t flowId; // MSCCL mscclflowid of this slot's send, 0 = none. GPU -> send proxy, Simple only
+  uint32_t rate;   // MSCCL send rate of this slot in MB/s, 0 = unpaced. GPU -> send proxy, Simple only
 };
+static_assert(sizeof(struct ncclConnFifo) == 32, "ncclConnFifo grew; check the ncclRecvMem connFifo layout");
 
 #include <stdio.h>
 

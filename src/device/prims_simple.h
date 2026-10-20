@@ -57,6 +57,7 @@ class Primitives<
   struct ncclConnInfo* conn = NULL;
   struct ncclConnFifo* connFifo = NULL;
   uint32_t currentFlowId = 0; // MSCCL flow id stamped into the send slots of subsequent sends, 0 = none
+  uint32_t currentRate = 0;   // MSCCL send rate (MB/s) stamped likewise, 0 = unpaced
   T* connEltsFifo;
   T* directBuff = NULL;
   uint64_t *connStepPtr;
@@ -154,7 +155,10 @@ private:
         connFifo[step%NCCL_STEPS].size = nelts*sizeof(T);
         // Stamped on every send, so a kernel that never sets an id (stock NCCL
         // on the same connection) writes 0 rather than leaving a stale one.
-        if (isSendNotRecv) connFifo[step%NCCL_STEPS].flowId = currentFlowId;
+        if (isSendNotRecv) {
+          connFifo[step%NCCL_STEPS].flowId = currentFlowId;
+          connFifo[step%NCCL_STEPS].rate = currentRate;
+        }
       }
 
       void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
@@ -725,6 +729,10 @@ private:
   // MSCCL flow id (0 = none) for subsequent sends; consumed by the send proxy.
   __device__ __forceinline__ void setFlowId(uint32_t flowId) {
     currentFlowId = flowId;
+  }
+  // MSCCL send rate in MB/s (0 = unpaced) for subsequent sends; paced by the IB plugin.
+  __device__ __forceinline__ void setSendRate(uint32_t rateMBps) {
+    currentRate = rateMBps;
   }
 
   __device__ Primitives(

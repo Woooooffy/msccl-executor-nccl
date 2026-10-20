@@ -128,6 +128,27 @@ NCCL_PARAM(IbSendQueueDepth, "IB_SEND_QUEUE_DEPTH", 0);
 // that the correctness check catches a header/data ordering bug.
 NCCL_PARAM(IbFlowHdrTestMisorder, "IB_FLOW_HDR_TEST_MISORDER", 0);
 
+// MSCCL rate control (NCCL_MSCCL_RATE, see net.cc). A send with an XML rate is
+// not posted by isend: isend queues it in its comm's pacer, and ncclIbPacerPump
+// posts its fragments a burst at a time as the rate allows, called by the proxy
+// on every progress pass. The bucket is kept as a deadline, nextNs, the earliest
+// time the next burst may go: a burst of B bytes at rate r moves it on by B/r
+// from where it was, not from now, so a pump that comes late catches up instead
+// of losing the time. The catch-up is capped at NCCL_MSCCL_RATE_CREDIT_BYTES
+// worth of the send's rate (the bucket depth; ns-3's PaceMaxCreditBytes), and
+// none is kept across an idle period: when a send arrives at an empty queue the
+// deadline restarts at now.
+//
+//   NCCL_MSCCL_RATE_BURST          fragments posted per doorbell when paced
+//   NCCL_MSCCL_RATE_CREDIT_BYTES   bucket depth; 0 = no catch-up, i.e. a pure
+//                                  rate cap (the old proxy-side pacer's behaviour)
+//   NCCL_MSCCL_RATE_TEST_STALL_US  TEST ONLY: after every 16th paced burst on a
+//                                  comm, post nothing for this long, to stand in
+//                                  for a progress thread that comes back late
+NCCL_PARAM(MscclRateBurst, "MSCCL_RATE_BURST", 2);
+NCCL_PARAM(MscclRateCreditBytes, "MSCCL_RATE_CREDIT_BYTES", 65536);
+NCCL_PARAM(MscclRateTestStallUs, "MSCCL_RATE_TEST_STALL_US", 0);
+
 // Default send queue depth when fragmentation is on: enough for 16 concurrent
 // fully-fragmented 512kB steps at a 4kB MTU. Raise NCCL_IB_SEND_QUEUE_DEPTH if
 // the "cannot fragment" warning fires.
@@ -910,6 +931,18 @@ struct ncclIbRequest {
       uint32_t lkeys[NCCL_IB_MAX_DEVS_PER_NIC];
       int offset;
       uint32_t flowId; // MSCCL flow id from ncclNetSendMeta, 0 = none
+      // Rate control: set when the send is queued in its comm's pacer. The
+      // receiver's clear-to-send entry is copied here because isend frees it
+      // before the fragments are posted.
+      uint32_t rateMBps;  // 0 = post everything as soon as it reaches the queue head
+      uint64_t remAddr;
+      uint32_t remRkey;
+      int qpIndex;
+      int headed;         // fragments carry a flow header
+      int fragData;       // payload bytes per fragment
+      int nfrag, fragNext;
+      uint64_t admitNs, firstPostNs; // for NCCL_MSCCL_RATE=2 logs
+      int bursts;
     } send;
     struct {
       int* sizes;
@@ -962,6 +995,7 @@ struct ncclIbQp {
 // matches completion order.
 struct ncclIbSqCredit {
   int outstanding;
+  int reserved; // WRs of sends admitted to the pacer but not posted yet
   uint32_t head, tail;
   uint16_t* pending; // [MAX_REQUESTS]
 };
@@ -1007,6 +1041,25 @@ struct alignas(32) ncclIbNetCommBase {
   struct ncclIbStats stats;
 };
 
+// Rate control state of one send comm, i.e. one MSCCL connection. Touched only
+// by the proxy progress thread. See the NCCL_MSCCL_RATE notes at the top.
+struct ncclIbPacer {
+  int on;
+  int burst;                // fragments per doorbell
+  uint64_t capBytes;        // bucket depth
+  uint64_t stallNs;         // TEST ONLY
+  uint64_t nextNs;          // bucket deadline: earliest time the next burst may be posted
+  uint64_t rem;             // remainder of the last charge (bytes*1000 % rate), so ns rounding never drifts
+  uint64_t stallUntil;
+  struct ncclIbRequest* q[MAX_REQUESTS]; // admitted, not fully posted, in clear-to-send order
+  uint32_t head, tail;
+  // Stats, logged at close with NCCL_MSCCL_RATE=2
+  uint64_t sends, bytes, bursts;
+  uint64_t floorClamps, lostNs; // catch-up the cap refused: lateness beyond capBytes
+  uint64_t waits;               // isend held back because the send queue was full
+  uint64_t lastPumpNs, maxPumpGapNs;
+};
+
 struct ncclIbSendComm {
   struct ncclIbNetCommBase base;
   // Start with fifo and ibv structs as they have alignment restrictions
@@ -1035,6 +1088,8 @@ struct ncclIbSendComm {
   // is freed, i.e. after the NIC has read it for every fragment.
   int flowHdrData; // data bytes per headed fragment: 128B multiple, + header <= fragSize
   struct ncclNetFlowHdr* flowHdrs; // [MAX_REQUESTS]
+
+  struct ncclIbPacer pacer; // NCCL_MSCCL_RATE
 };
 // The SendFifo needs to be 32-byte aligned and each element needs
 // to be a 32-byte multiple, so that an entry does not get split and
@@ -1265,14 +1320,47 @@ static ncclResult_t ncclIbSetupFlowHdr(struct ncclIbSendComm* comm) {
   return ncclSuccess;
 }
 
+// Rate control: the pacer posts a send's fragments in bursts, so it needs them.
+static ncclResult_t ncclIbSetupPacer(struct ncclIbSendComm* comm) {
+  // A pacer queue is strictly in order, and a send is paced on one QP. A send
+  // split over several QPs would need its passes ordered across them.
+  int passes = ncclParamIbSplitDataOnQps() ? comm->base.nqps : comm->base.ndevs;
+  if (passes != 1) {
+    WARN("NET/IB: NCCL_MSCCL_RATE needs each send on a single QP, but sends are split over %d "
+         "(set NCCL_IB_SPLIT_DATA_ON_QPS=0 or NCCL_IB_QPS_PER_CONNECTION=1, and use one NIC per connection)", passes);
+    return ncclInvalidUsage;
+  }
+  struct ncclIbPacer* p = &comm->pacer;
+  int64_t burst = ncclParamMscclRateBurst();
+  if (burst < 1) burst = 1;
+  if (burst > comm->fragCap - 1) burst = comm->fragCap - 1;
+  int64_t cap = ncclParamMscclRateCreditBytes();
+  int64_t stallUs = ncclParamMscclRateTestStallUs();
+  p->burst = (int)burst;
+  p->capBytes = cap < 0 ? 0 : (uint64_t)cap;
+  p->stallNs = stallUs > 0 ? (uint64_t)stallUs * 1000 : 0;
+  p->on = 1;
+  INFO(NCCL_NET, "NET/IB: MSCCL rate control on: %d fragments per burst, credit cap %lu bytes%s",
+       p->burst, (unsigned long)p->capBytes,
+       p->stallNs ? " -- TEST STALL: the pacer pauses every 16 bursts" : "");
+  return ncclSuccess;
+}
+
 static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
   int64_t fragParam = ncclParamIbFragSize();
   // With flow headers on, every way of ending up unfragmented is an error: a
   // send without fragments carries no headers, and nothing else would say so.
+  // Rate control likewise has nothing to pace without fragments.
   bool flowHdr = ncclParamMscclFlowId() != 0;
+  bool rate = ncclParamMscclRate() != 0;
+  bool needFrag = flowHdr || rate;
   if (fragParam == 0) {
     if (flowHdr) {
       WARN("NET/IB: NCCL_MSCCL_FLOW_ID needs MTU fragmentation to put a header in every packet; set NCCL_IB_FRAG_SIZE");
+      return ncclInvalidUsage;
+    }
+    if (rate) {
+      WARN("NET/IB: NCCL_MSCCL_RATE paces sends a few fragments at a time and needs MTU fragmentation; set NCCL_IB_FRAG_SIZE");
       return ncclInvalidUsage;
     }
     return ncclSuccess;
@@ -1298,7 +1386,7 @@ static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
   fragSize = (fragSize/128)*128;
   if (fragSize < 128) {
     WARN("NET/IB: NCCL_IB_FRAG_SIZE=%ld resolves to %d bytes, too small to fragment; disabling", (long)fragParam, fragSize);
-    return flowHdr ? ncclInvalidUsage : ncclSuccess;
+    return needFrag ? ncclInvalidUsage : ncclSuccess;
   }
 
   // A pass can never post more WRs than the shallowest send queue holds, so the
@@ -1309,7 +1397,7 @@ static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
   }
   if (cap < NCCL_NET_IB_MAX_RECVS + 1) {
     WARN("NET/IB: send queue depth %d too small to fragment; disabling", cap);
-    return flowHdr ? ncclInvalidUsage : ncclSuccess;
+    return needFrag ? ncclInvalidUsage : ncclSuccess;
   }
 
   int batch = (int)ncclParamIbFragBatch();
@@ -1329,6 +1417,7 @@ static ncclResult_t ncclIbSetupFrag(struct ncclIbSendComm* comm) {
   INFO(NCCL_NET, "NET/IB: MTU fragmentation on: fragSize=%d batch=%d sqDepth=%d nqps=%d",
       fragSize, batch, cap, comm->base.nqps);
   if (flowHdr) NCCLCHECK(ncclIbSetupFlowHdr(comm));
+  if (rate) NCCLCHECK(ncclIbSetupPacer(comm));
   return ncclSuccess;
 }
 
@@ -2233,6 +2322,214 @@ static ncclResult_t ncclIbMultiSendFrag(struct ncclIbSendComm* comm, int slot) {
   return ncclSuccess;
 }
 
+// ---- Rate control: the pacer (see the NCCL_MSCCL_RATE notes at the top) ----
+
+static inline bool ncclIbPacerBusy(struct ncclIbSendComm* comm) {
+  return comm->pacer.on && comm->pacer.head != comm->pacer.tail;
+}
+
+// Whether a send of `size` bytes to a receive advertising `headroom` can be
+// admitted to the pacer now. Its fragments, plus the trailing IMM WR, must all
+// fit the send queue next to what is posted and what earlier queued sends will
+// post. If not, the caller returns no request, exactly as when the receiver has
+// not posted yet, and the proxy retries on its next pass. A send that could not
+// fit even into an empty queue would wait forever, so that is an error.
+static ncclResult_t ncclIbPacerFits(struct ncclIbSendComm* comm, int size, uint32_t headroom,
+                                    bool* fits, int* nfrag, int* headed, int* fragData) {
+  ncclIbQp* qp = comm->base.qps + comm->base.qpIndex;
+  struct ncclIbSqCredit* credit = comm->sqCredit + comm->base.qpIndex;
+  *headed = comm->flowHdrData > 0 && headroom >= (uint32_t)sizeof(struct ncclNetFlowHdr);
+  *fragData = *headed ? comm->flowHdrData : comm->fragSize;
+  *nfrag = size > 0 ? DIVUP(size, *fragData) : 0;
+  int need = *nfrag + 1;
+  if (need > qp->sqDepth - 1) {
+    WARN("NET/IB: a %d-byte paced send needs %d send queue slots, more than the queue's %d can ever hold. "
+         "Raise NCCL_IB_SEND_QUEUE_DEPTH or lower NCCL_BUFFSIZE.", size, need, qp->sqDepth);
+    return ncclInvalidUsage;
+  }
+  *fits = need <= qp->sqDepth - credit->outstanding - credit->reserved - 1;
+  return ncclSuccess;
+}
+
+// Post the next n fragments of a queued send, and its IMM WR if that finishes
+// it, chained `perDoorbell` WRs to an ibv_post_send. Fragment layout, header
+// SGEs and posting order are those of ncclIbMultiSendFrag for a single-request
+// single-pass send: a headed send goes last fragment first, so every header but
+// fragment 0's is overwritten by the fragment before it.
+static ncclResult_t ncclIbPacerPost(struct ncclIbSendComm* comm, struct ncclIbRequest* r, int n,
+                                    int perDoorbell, int* bytesOut) {
+  ncclIbQp* qp = comm->base.qps + r->send.qpIndex;
+  int devIndex = qp->devIndex;
+  struct ncclIbSqCredit* credit = comm->sqCredit + r->send.qpIndex;
+  const int hdrSize = sizeof(struct ncclNetFlowHdr);
+  bool descending = r->send.headed && !ncclParamIbFlowHdrTestMisorder();
+  struct ncclNetFlowHdr* hdrBuf = comm->flowHdrs ? comm->flowHdrs + (r - comm->base.reqs) : NULL;
+  bool last = r->send.fragNext + n == r->send.nfrag;
+
+  int nwr = 0, bytes = 0;
+  for (int k = 0; k < n; k++) {
+    int f = r->send.fragNext + k;
+    int off = (descending ? r->send.nfrag-1-f : f) * r->send.fragData;
+    int flen = std::min(r->send.fragData, r->send.size - off);
+    struct ibv_sge* sge = comm->fragSges + 2*nwr;
+    struct ibv_send_wr* wr = comm->fragWrs + nwr;
+    memset(wr, 0, sizeof(struct ibv_send_wr));
+    int nsge = 0;
+    if (r->send.headed) {
+      sge[nsge].addr   = (uintptr_t)hdrBuf;
+      sge[nsge].length = hdrSize;
+      sge[nsge].lkey   = comm->devs[devIndex].flowHdrMr->lkey;
+      nsge++;
+    }
+    sge[nsge].addr   = (uintptr_t)r->send.data + off;
+    sge[nsge].length = flen;
+    sge[nsge].lkey   = r->send.lkeys[devIndex];
+    nsge++;
+    wr->opcode  = IBV_WR_RDMA_WRITE;
+    wr->sg_list = sge;
+    wr->num_sge = nsge;
+    wr->wr.rdma.remote_addr = r->send.remAddr + off - (r->send.headed ? hdrSize : 0);
+    wr->wr.rdma.rkey        = r->send.remRkey;
+    nwr++;
+    bytes += flen;
+  }
+  if (last) {
+    // Same trailing WR as ncclIbMultiSendFrag with one request: carries the
+    // completion and the size, as imm_data.
+    struct ibv_send_wr* lastWr = comm->fragWrs + nwr;
+    memset(lastWr, 0, sizeof(struct ibv_send_wr));
+    lastWr->wr_id = (uint64_t)(r - comm->base.reqs);
+    lastWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+    lastWr->imm_data = r->send.size;
+    lastWr->send_flags = IBV_SEND_SIGNALED;
+    nwr++;
+  }
+  for (int b = 0; b < nwr; b += perDoorbell) {
+    int m = std::min(perDoorbell, nwr - b);
+    for (int j = 0; j < m-1; j++) comm->fragWrs[b+j].next = comm->fragWrs + b+j+1;
+    comm->fragWrs[b+m-1].next = NULL;
+    struct ibv_send_wr* bad_wr;
+    NCCLCHECK(wrap_ibv_post_send(qp->qp, comm->fragWrs + b, &bad_wr));
+  }
+
+  // The WRs move from reserved to outstanding as they are posted. The send's
+  // single completion releases all of them, so its entry in the completion FIFO
+  // is pushed with the IMM, holding the whole count.
+  credit->reserved -= nwr;
+  credit->outstanding += nwr;
+  if (last) {
+    if (credit->tail - credit->head >= MAX_REQUESTS) {
+      WARN("NET/IB: send queue credit ring overflow (%u outstanding passes)", credit->tail - credit->head);
+      return ncclInternalError;
+    }
+    credit->pending[credit->tail % MAX_REQUESTS] = (uint16_t)(r->send.nfrag + 1);
+    credit->tail++;
+  }
+  r->send.fragNext += n;
+  *bytesOut = bytes;
+  return ncclSuccess;
+}
+
+// Post every burst that is due now, in queue order, without ever waiting.
+static ncclResult_t ncclIbPacerPump(struct ncclIbSendComm* comm, int* pending) {
+  struct ncclIbPacer* p = &comm->pacer;
+  *pending = 0;
+  if (p->head == p->tail) return ncclSuccess;
+  uint64_t now = clockNano();
+  if (p->lastPumpNs && now - p->lastPumpNs > p->maxPumpGapNs) p->maxPumpGapNs = now - p->lastPumpNs;
+  p->lastPumpNs = now;
+
+  while (p->head != p->tail) {
+    struct ncclIbRequest* r = p->q[p->head % MAX_REQUESTS];
+    uint32_t rate = r->send.rateMBps;
+    int n = r->send.nfrag - r->send.fragNext;
+    if (rate) {
+      if (p->stallNs && (int64_t)(p->stallUntil - now) > 0) break;
+      // Credit cap: the deadline may trail now by at most capBytes at this
+      // send's rate. Anything later than that is lost, and counted.
+      uint64_t capNs = p->capBytes * 1000 / rate;
+      if ((int64_t)(now - capNs - p->nextNs) > 0) {
+        p->floorClamps++;
+        p->lostNs += now - capNs - p->nextNs;
+        p->nextNs = now - capNs;
+        p->rem = 0;
+      }
+      if ((int64_t)(p->nextNs - now) > 0) break; // not due yet
+      if (n > p->burst) n = p->burst;
+    }
+    // A send that reaches the head with no rate (it queued behind a paced one
+    // only to keep the order) goes out whole, at stage-1 doorbell spacing.
+    int bytes;
+    if (r->send.fragNext == 0) r->send.firstPostNs = now;
+    NCCLCHECK(ncclIbPacerPost(comm, r, n, rate ? n+1 : comm->fragBatch, &bytes));
+    p->bytes += bytes;
+    if (rate) {
+      // Charge the burst at this send's own rate, from the previous deadline,
+      // so the gap after a send's last burst is its own too. Integer ns with
+      // the remainder carried: exact over any number of bursts.
+      uint64_t num = (uint64_t)bytes * 1000 + p->rem;
+      p->nextNs += num / rate;
+      p->rem = num % rate;
+      p->bursts++;
+      r->send.bursts++;
+      if (p->stallNs && p->bursts % 16 == 0) p->stallUntil = now + p->stallNs;
+    }
+    if (r->send.fragNext == r->send.nfrag) {
+      if (ncclParamMscclRate() == 2 && rate) {
+        INFO(NCCL_NET, "MSCCL rate send: comm %p size %d rate %u MB/s bursts %d queued %lu ns posting %lu ns (%lu ns at rate)",
+             comm, r->send.size, rate, r->send.bursts, (unsigned long)(r->send.firstPostNs - r->send.admitNs),
+             (unsigned long)(now - r->send.firstPostNs), (unsigned long)((uint64_t)(r->send.size - bytes) * 1000 / rate));
+      }
+      p->head++;
+    }
+  }
+  *pending = (p->head != p->tail);
+  // The pump-gap statistic is about a backlogged queue; an idle one is not late.
+  if (!*pending) p->lastPumpNs = 0;
+  return ncclSuccess;
+}
+
+// Queue a matched send in the pacer. The clear-to-send entry it matched is
+// freed by the caller right after, so everything the fragments need from it is
+// copied into the request here.
+static ncclResult_t ncclIbPacerAdmit(struct ncclIbSendComm* comm, volatile struct ncclIbSendFifo* slot,
+                                     struct ncclIbRequest* req, uint32_t rateMBps,
+                                     int nfrag, int headed, int fragData) {
+  struct ncclIbPacer* p = &comm->pacer;
+  if (p->tail - p->head >= MAX_REQUESTS) {
+    WARN("NET/IB: pacer queue overflow (%u sends queued)", p->tail - p->head);
+    return ncclInternalError;
+  }
+  int qpIndex = comm->base.qpIndex;
+  ncclIbQp* qp = comm->base.qps + qpIndex;
+  req->send.rateMBps = rateMBps;
+  req->send.remAddr = slot->addr;
+  req->send.remRkey = slot->rkeys[qp->remDevIdx];
+  req->send.qpIndex = qpIndex;
+  req->send.headed = headed;
+  req->send.fragData = fragData;
+  req->send.nfrag = nfrag;
+  req->send.fragNext = 0;
+  req->send.bursts = 0;
+  uint64_t now = clockNano();
+  req->send.admitNs = now;
+  comm->sqCredit[qpIndex].reserved += nfrag + 1;
+  // Idle reset: a send arriving at an empty queue starts the bucket at now, so
+  // no credit is carried across a period with nothing to send. A deadline still
+  // in the future (the previous send's last gap) is kept.
+  if (p->head == p->tail && (int64_t)(now - p->nextNs) > 0) {
+    p->nextNs = now;
+    p->rem = 0;
+  }
+  p->q[p->tail % MAX_REQUESTS] = req;
+  p->tail++;
+  p->sends++;
+  // One pass per send (ncclIbSetupPacer), so move on to the next QP as
+  // ncclIbMultiSendFrag does after its pass.
+  comm->base.qpIndex = (comm->base.qpIndex+1) % comm->base.nqps;
+  return ncclSuccess;
+}
+
 // meta may be NULL (plain ncclNet isend). It is copied into the request, so the
 // caller's copy need not outlive the call.
 static ncclResult_t ncclIbIsendImpl(void* sendComm, void* data, int size, int tag, void* mhandle,
@@ -2257,6 +2554,12 @@ static ncclResult_t ncclIbIsendImpl(void* sendComm, void* data, int size, int ta
   // Wait until all data has arrived
   for (int r=1; r<nreqs; r++) while(slots[r].idx != idx);
   __sync_synchronize(); // order the nreqsPtr load against tag/rkey/addr loads below
+  // Rate control keeps a comm's sends in clear-to-send order: a send must not
+  // overtake one still queued in the pacer, or its IMM would complete the
+  // receiver's earlier receive. A multi-receive group is never paced, so it
+  // waits for the queue to drain, before taking any request.
+  bool pacerBusy = ncclIbPacerBusy(comm);
+  if (nreqs > 1 && pacerBusy) { *request = NULL; return ncclSuccess; }
   for (int r=0; r<nreqs; r++) {
     if (reqs[r] != NULL || slots[r].tag != tag) continue;
 
@@ -2269,6 +2572,18 @@ static ncclResult_t ncclIbIsendImpl(void* sendComm, void* data, int size, int ta
       WARN("NET/IB : req %d/%d tag %x peer %s posted incorrect receive info: size %d addr %lx rkeys[0]=%x",
         r, nreqs, tag, ncclSocketToString(&addr, line), slots[r].size, slots[r].addr, slots[r].rkeys[0]);
       return ncclInternalError;
+    }
+
+    // A send with a rate goes through the pacer, and so does any send while
+    // paced ones are queued. It is admitted only once all of its fragments fit
+    // the send queue; until then it is not taken, as if the receiver had not
+    // posted yet, and the proxy retries on its next pass.
+    bool paced = comm->pacer.on && nreqs == 1 && ((meta && meta->rateMBps) || pacerBusy);
+    int nfrag = 0, headed = 0, fragData = 0;
+    if (paced) {
+      bool fits;
+      NCCLCHECK(ncclIbPacerFits(comm, size, slots[r].headroom, &fits, &nfrag, &headed, &fragData));
+      if (!fits) { comm->pacer.waits++; *request = NULL; return ncclSuccess; }
     }
 
     struct ncclIbRequest* req;
@@ -2317,7 +2632,13 @@ static ncclResult_t ncclIbIsendImpl(void* sendComm, void* data, int size, int ta
     }
 
     TIME_START(0);
-    if (comm->fragSize > 0) {
+    if (paced) {
+      // Queue it and post whatever is due now; the rest goes out from
+      // progressSend on later proxy passes.
+      NCCLCHECK(ncclIbPacerAdmit(comm, slots, req, meta ? meta->rateMBps : 0, nfrag, headed, fragData));
+      int pending;
+      NCCLCHECK(ncclIbPacerPump(comm, &pending));
+    } else if (comm->fragSize > 0) {
       NCCLCHECK(ncclIbMultiSendFrag(comm, slot));
     } else {
       NCCLCHECK(ncclIbMultiSend(comm, slot));
@@ -2344,6 +2665,13 @@ static ncclResult_t ncclIbIsendMeta(void* sendComm, void* data, int size, int ta
   return ncclIbIsendImpl(sendComm, data, size, tag, mhandle, meta, request);
 }
 
+static ncclResult_t ncclIbProgressSend(void* sendComm, int* pending) {
+  struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
+  *pending = 0;
+  if (comm == NULL || !comm->pacer.on) return ncclSuccess;
+  return ncclIbPacerPump(comm, pending);
+}
+
 static ncclResult_t ncclIbSetMrHeadroom(void* mhandle, int bytes) {
   if (mhandle == NULL || bytes < 0) return ncclInternalError;
   ((struct ncclIbMrHandle*)mhandle)->headroom = bytes;
@@ -2353,6 +2681,7 @@ static ncclResult_t ncclIbSetMrHeadroom(void* mhandle, int bytes) {
 ncclNetMscclExt_t ncclNetIbMscclExt = {
   ncclIbIsendMeta,
   ncclIbSetMrHeadroom,
+  ncclIbProgressSend,
 };
 
 ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
@@ -2633,6 +2962,17 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
 ncclResult_t ncclIbCloseSend(void* sendComm) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm) {
+    struct ncclIbPacer* p = &comm->pacer;
+    if (p->on) {
+      if (p->head != p->tail) WARN("NET/IB: closing a send comm with %u paced sends not fully posted", p->tail - p->head);
+      if (ncclParamMscclRate() == 2) {
+        INFO(NCCL_NET, "MSCCL rate stats: comm %p sends %lu bytes %lu bursts %lu floorClamps %lu lostNs %lu "
+             "sqWaits %lu maxPumpGapNs %lu (credit cap %lu bytes, %d fragments per burst)",
+             comm, (unsigned long)p->sends, (unsigned long)p->bytes, (unsigned long)p->bursts,
+             (unsigned long)p->floorClamps, (unsigned long)p->lostNs, (unsigned long)p->waits,
+             (unsigned long)p->maxPumpGapNs, (unsigned long)p->capBytes, p->burst);
+      }
+    }
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
 
     for (int q = 0; q < comm->base.nqps; q++)

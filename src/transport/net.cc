@@ -147,7 +147,8 @@ struct sendNetResources {
   int netDeviceVersion;
   ncclNetDeviceType netDeviceType;
   ncclNetDeviceHandle_t* netDeviceHandle;
-  ncclNetMscclExt_t* mscclNetExt; // non-NULL iff MSCCL flow ids are passed to the net
+  ncclNetMscclExt_t* mscclNetExt; // non-NULL iff MSCCL flow ids or rates are passed to the net
+  int ratePaced;                  // sends go through the IB plugin's pacer, which needs progressSend calls
 
   // MSCCL net gates: progress of the op running on this connection, for gated
   // sends on other connections of the same progress thread. Written only by
@@ -210,6 +211,14 @@ NCCL_PARAM(NetSharedComms, "NET_SHARED_COMMS", 1);
 //   2 as 1, and log at INFO/NET every send's flow id and, when the receive
 //     buffer is in host memory, the header each receive found in its pad
 NCCL_PARAM(MscclFlowId, "MSCCL_FLOW_ID", 0);
+// Pace each MSCCL send at its XML rate (stamped per slot by the GPU, like the
+// flow id). The IB plugin posts a send's fragments in small bursts on an
+// accumulating token bucket; see the rate control notes in net_ib.cc.
+// Requires the built-in IB transport with fragmentation on (NCCL_IB_FRAG_SIZE).
+//   0 off
+//   1 on
+//   2 as 1, and log at INFO/NET each paced send and each connection's pacing stats
+NCCL_PARAM(MscclRate, "MSCCL_RATE", 0);
 
 struct setupReq {
   int tpRank;
@@ -729,13 +738,15 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
   ncclResult_t ret = ncclSuccess;
   netSendConnectArgs* req = (netSendConnectArgs*) reqBuff;
   NCCLCHECK(ncclNetGetDeviceHandle(resources->netDeviceType, resources->netDeviceVersion, false /*isRecv*/, &resources->netDeviceHandle));
-  if (ncclParamMscclFlowId()) {
-    // Fail here rather than send without the ids an XML asked for.
+  if (ncclParamMscclFlowId() || ncclParamMscclRate()) {
+    // Fail here rather than send without the ids or rates an XML asked for.
     if (proxyState->ncclNet != &ncclNetIb) {
-      WARN("NCCL_MSCCL_FLOW_ID requires the built-in IB transport, but net %s is in use", proxyState->ncclNet->name);
+      WARN("%s requires the built-in IB transport, but net %s is in use",
+           ncclParamMscclFlowId() ? "NCCL_MSCCL_FLOW_ID" : "NCCL_MSCCL_RATE", proxyState->ncclNet->name);
       return ncclInvalidUsage;
     }
     resources->mscclNetExt = &ncclNetIbMscclExt;
+    resources->ratePaced = ncclParamMscclRate() != 0;
   }
   if (resources->shared) {
     // Shared buffers
@@ -854,6 +865,7 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
   for (int i=0; i<NCCL_STEPS; i++) {
     resources->recvMem->connFifo[i].size = -1;
     resources->recvMem->connFifo[i].flowId = 0;
+    resources->recvMem->connFifo[i].rate = 0;
   }
 
   for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
@@ -1234,6 +1246,15 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       struct sendNetResources* resources = (struct sendNetResources*) (sub->connection->transportResources);
       volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
       int stepSize = resources->buffSizes[p] / NCCL_STEPS;
+      // Rate control: an isend returns once its send is queued in the plugin's
+      // pacer, and the fragments go out over later passes. Pump it on every
+      // pass, before the branches below can `continue` past it, and keep the
+      // thread from yielding while fragments are waiting for their time.
+      if (resources->ratePaced) {
+        int pending;
+        NCCLCHECK(resources->mscclNetExt->progressSend(resources->netSendComm, &pending));
+        if (pending) args->idle = 0;
+      }
       char* localBuff = NCCL_NET_MAP_GET_POINTER(&resources->map, cpu, buffs[p]);
       // Post buffers to the GPU
       if (sub->posted < sub->nsteps && sub->posted < sub->done + maxDepth) {
@@ -1315,6 +1336,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
               // registered-buffer send does not go through the per-slot fifo.
               struct ncclNetSendMeta meta;
               meta.flowId = (p == NCCL_PROTO_SIMPLE && !sub->reg) ? connFifo[buffSlot].flowId : 0;
+              meta.rateMBps = (p == NCCL_PROTO_SIMPLE && !sub->reg && resources->ratePaced) ? connFifo[buffSlot].rate : 0;
               NCCLCHECK(resources->mscclNetExt->isendMeta(resources->netSendComm, buff, size, resources->tpRank, sub->mhandle, &meta, sub->requests+buffSlot));
               if (sub->requests[buffSlot] != NULL && ncclParamMscclFlowId() == 2) {
                 INFO(NCCL_NET, "MSCCL flowid send: rank %d -> %d channel %d proto %d slot %d size %d flowId %u",
@@ -1387,11 +1409,12 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
             }
           }
           // Make sure size is reset to -1 before we update the head. The flow id
-          // is cleared too, so a later LL/LL128 send on this slot, which never
-          // stamps one, cannot inherit it.
+          // and rate are cleared too, so a later LL/LL128 send on this slot,
+          // which never stamps them, cannot inherit them.
           if (sub->reg == 0) {
             connFifo[buffSlot].size = -1;
             connFifo[buffSlot].flowId = 0;
+            connFifo[buffSlot].rate = 0;
           }
           __sync_synchronize();
 

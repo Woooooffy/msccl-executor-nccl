@@ -242,6 +242,7 @@ __device__ __forceinline__ void mscclRunInterpreter(
       dstPointer = (t->dstBuffer == MSCCL_INPUT_BUFFER) ? thisInput : ((t->dstBuffer == MSCCL_OUTPUT_BUFFER) ? thisOutput : thisScratch);
       prims.setDataPtrs(srcPointer, dstPointer);
       prims.setFlowId(mscclShmem.mscclTB.sendFlowId[i]); // 0 for steps without a send
+      prims.setSendRate(mscclShmem.mscclTB.sendRateMBps[i]); // likewise; 0 = unpaced
       int count = t->count;
       for (int c = 0; c < count; c += maxAllowedCount) {
         srcOffset = gridOffset + (ssize_t) (t->srcOffset+c) * sizePerMscclChunk;

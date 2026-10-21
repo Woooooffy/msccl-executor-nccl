@@ -706,13 +706,37 @@ static ncclResult_t removeOp(struct ncclProxyProgressState* state, struct ncclPr
   return ncclSuccess;
 }
 
-static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclProxyProgressState* state, struct ncclProxyArgs* opStart, int* idle) {
+// Slow-pass diagnostics (NCCL_PROXY_PASS_LOG_US): the op whose progress call
+// took longest in this pass. Filled only when slow != NULL.
+struct proxyPassSlowest {
+  uint64_t ns;
+  int send, peer, channelId, nsubs, protocol, nops;
+  uint64_t opCount;
+};
+
+static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclProxyProgressState* state, struct ncclProxyArgs* opStart, int* idle,
+                               struct proxyPassSlowest* slow = NULL) {
   struct ncclProxyArgs* prevOp = NULL;
   struct ncclProxyArgs* op = opStart;
   while (op) {
     if (op->state == ncclProxyOpNone) return ncclInternalError;
     TIME_START(0); TIME_START(1);
+    uint64_t t0 = slow ? clockNano() : 0;
     NCCLCHECK(op->progress(proxyState, op));
+    if (slow) {
+      uint64_t dt = clockNano() - t0;
+      slow->nops++;
+      if (dt > slow->ns) {
+        struct ncclProxySubArgs* sub = op->subs;
+        slow->ns = dt;
+        slow->send = sub->connection ? sub->connection->send : -1;
+        slow->peer = sub->peer;
+        slow->channelId = sub->channelId;
+        slow->nsubs = op->nsubs;
+        slow->protocol = op->protocol;
+        slow->opCount = op->opCount;
+      }
+    }
     if (op->idle) { TIME_STOP(1); TIME_CANCEL(0); } else { TIME_CANCEL(1); TIME_STOP(0); }
     *idle &= op->idle;
     if (op->state == ncclProxyOpNone) {
@@ -869,6 +893,12 @@ exit:
 // Set to SIGUSR1 or SIGUSR2 to help debug proxy state during hangs
 NCCL_PARAM(ProxyDumpSignal, "PROXY_DUMP_SIGNAL", -1);
 NCCL_PARAM(ProgressAppendOpFreq, "PROGRESS_APPENDOP_FREQ", 8);
+// Diagnostics: log, at INFO/PROXY, every progress-loop pass that takes longer
+// than this many microseconds, with where the time went: the ops' progress
+// calls (and the slowest one), fetching newly posted ops, and sched_yield. The
+// thread's CPU time over the pass tells a busy pass (cpu ~ wall) from one where
+// the thread was not running (cpu << wall). 0 = off, at no cost.
+NCCL_PARAM(ProxyPassLogUs, "PROXY_PASS_LOG_US", 0);
 
 void* ncclProxyProgress(void *proxyState_) {
   struct ncclProxyState* proxyState = (struct ncclProxyState*)proxyState_;
@@ -897,9 +927,21 @@ void* ncclProxyProgress(void *proxyState_) {
    * ncclParamProgressAppendOpFreq(). If they are equal, we will append proxy ops. This will decrease the
    * frequency of calling ncclProxyGetPostedOps() and reduce the perf impact. */
   int proxyOpAppendCounter = 0;
+  const uint64_t passLogNs = (uint64_t)ncclParamProxyPassLogUs() * 1000;
+  uint64_t passes = 0, slowPasses = 0, maxPassNs = 0;
   while (state->stop == 0 || (state->stop == 1 && state->active)) {
     int idle = 1;
-    ncclResult_t ret = progressOps(proxyState, state, state->active, &idle);
+    struct proxyPassSlowest slow = {};
+    uint64_t passStart = 0, cpuStart = 0, opsNs = 0, getOpsNs = 0, yieldNs = 0;
+    int addedLog = -1;
+    struct timespec ts;
+    if (passLogNs) {
+      passStart = clockNano();
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+      cpuStart = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    }
+    ncclResult_t ret = progressOps(proxyState, state, state->active, &idle, passLogNs ? &slow : NULL);
+    if (passLogNs) opsNs = clockNano() - passStart;
     if (ret != ncclSuccess) {
       __atomic_store_n(&proxyState->asyncResult, ret, __ATOMIC_RELEASE);
       INFO(NCCL_ALL,"%s:%d -> %d [Progress Thread]", __FILE__, __LINE__, ret);
@@ -914,18 +956,42 @@ void* ncclProxyProgress(void *proxyState_) {
       int added = 0;
       proxyOpAppendCounter = 0;
       TIME_START(3);
+      uint64_t t = passLogNs ? clockNano() : 0;
       if (state->stop == 0)
         ret = ncclProxyGetPostedOps(proxyState, &added);
+      if (passLogNs) { getOpsNs = clockNano() - t; addedLog = added; }
       if (added) { TIME_STOP(3); } else { TIME_CANCEL(3); }
       if (ret != ncclSuccess) {
         __atomic_store_n(&proxyState->asyncResult, ret, __ATOMIC_RELEASE);
         INFO(NCCL_ALL,"%s:%d -> %d [Progress Thread]", __FILE__, __LINE__, ret);
       }
       if (added == 0) {
+        t = passLogNs ? clockNano() : 0;
         sched_yield(); // No request progressed. Let others run.
+        if (passLogNs) yieldNs = clockNano() - t;
       }
     }
     lastIdle = idle;
+    if (passLogNs) {
+      uint64_t wall = clockNano() - passStart;
+      passes++;
+      if (wall > maxPassNs) maxPassNs = wall;
+      if (wall > passLogNs) {
+        slowPasses++;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        uint64_t cpu = ts.tv_sec * 1000000000ULL + ts.tv_nsec - cpuStart;
+        INFO(NCCL_PROXY, "proxy slow pass: wall %lu us cpu %lu us on core %d; progressOps %lu us over %d ops "
+             "(slowest %lu us: %s peer %d ch %d nsubs %d proto %d opCount %lu); getPostedOps %lu us (added %d); yield %lu us",
+             (unsigned long)(wall/1000), (unsigned long)(cpu/1000), sched_getcpu(), (unsigned long)(opsNs/1000), slow.nops,
+             (unsigned long)(slow.ns/1000), slow.send == 1 ? "send" : slow.send == 0 ? "recv" : "?", slow.peer, slow.channelId,
+             slow.nsubs, slow.protocol, (unsigned long)slow.opCount, (unsigned long)(getOpsNs/1000), addedLog,
+             (unsigned long)(yieldNs/1000));
+      }
+    }
+  }
+  if (passLogNs) {
+    INFO(NCCL_PROXY, "proxy pass stats: %lu passes, %lu over %lu us, longest %lu us",
+         (unsigned long)passes, (unsigned long)slowPasses, (unsigned long)(passLogNs/1000), (unsigned long)(maxPassNs/1000));
   }
   return NULL;
 }
